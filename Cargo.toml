@@ -25,8 +25,8 @@ members = [
 # rev, naming the same revs virtiofsd does, so a crate compiled here and one
 # compiled there are the same crate. See ~/.cargo/config.toml for why the pin
 # belongs in each consuming workspace rather than machine-wide.
-vhost = { git = "https://github.com/pgalbraith/vhost.git", rev = "5e600ddc8ecf3f603254251431f37a5daa41c8e4", features = ["vhost-user-backend"] }
-vhost-user-backend = { git = "https://github.com/pgalbraith/vhost.git", rev = "5e600ddc8ecf3f603254251431f37a5daa41c8e4" }
+vhost = { git = "https://github.com/pgalbraith/vhost.git", rev = "cf0be2996d4478f3532ce5afa613f33f727bb0ca", features = ["vhost-user-backend"] }
+vhost-user-backend = { git = "https://github.com/pgalbraith/vhost.git", rev = "cf0be2996d4478f3532ce5afa613f33f727bb0ca" }
 virtio-bindings = "0.2.5"
 virtio-queue = "0.18"
 vm-memory = "0.18.0"
@@ -72,5 +72,5 @@ cloned_ref_to_slice_refs = "allow"
 # patch them to the same rev so one copy resolves everywhere. Two copies
 # compile, then fail to unify generic types like GuestMemoryMmap between them.
 [patch.crates-io]
-vm-memory = { git = "https://github.com/pgalbraith/rust-vmm.git", rev = "3ce15898034320b892f2b99fbf2db665f838a7a2" }
-vmm-sys-util = { git = "https://github.com/pgalbraith/rust-vmm.git", rev = "3ce15898034320b892f2b99fbf2db665f838a7a2" }
+vm-memory = { git = "https://github.com/pgalbraith/rust-vmm.git", rev = "a0546643c1c1345f8179e2de5dd39ec8fd127981" }
+vmm-sys-util = { git = "https://github.com/pgalbraith/rust-vmm.git", rev = "a0546643c1c1345f8179e2de5dd39ec8fd127981" }
