@@ -3,14 +3,19 @@
 use std::{
     io::{ErrorKind, Write},
     num::Wrapping,
-    os::unix::prelude::{AsRawFd, RawFd},
+    sync::Arc,
 };
+
+use vmm_sys_util::epoll::EventSet;
+
+use crate::platform::AsRawDescriptor;
 
 use log::{error, info};
 use virtio_vsock::packet::{VsockPacket, PKT_HEADER_SIZE};
 use vm_memory::{bitmap::BitmapSlice, ReadVolatile, VolatileSlice, WriteVolatile};
 
 use crate::{
+    registrar::Registrar,
     rxops::*,
     rxqueue::*,
     thread_backend::IsHybridVsock,
@@ -48,15 +53,15 @@ pub(crate) struct VsockConnection<S> {
     peer_fwd_cnt: Wrapping<u32>,
     /// The total number of bytes sent to the guest vsock driver.
     rx_cnt: Wrapping<u32>,
-    /// epoll fd to which this connection's stream has to be added.
-    pub epoll_fd: RawFd,
+    /// Where this connection's stream is registered for readiness.
+    pub registrar: Arc<Registrar>,
     /// Local tx buffer.
     pub tx_buf: LocalTxBuf,
     /// Local tx buffer size
     tx_buffer_size: u32,
 }
 
-impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockConnection<S> {
+impl<S: AsRawDescriptor + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockConnection<S> {
     /// Create a new vsock connection object for locally i.e host-side
     /// inititated connections.
     pub fn new_local_init(
@@ -65,7 +70,7 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
         local_port: u32,
         guest_cid: u64,
         guest_port: u32,
-        epoll_fd: RawFd,
+        registrar: Arc<Registrar>,
         tx_buffer_size: u32,
     ) -> Self {
         Self {
@@ -81,7 +86,7 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
             peer_buf_alloc: 0,
             peer_fwd_cnt: Wrapping(0),
             rx_cnt: Wrapping(0),
-            epoll_fd,
+            registrar,
             tx_buf: LocalTxBuf::new(tx_buffer_size),
             tx_buffer_size,
         }
@@ -96,7 +101,7 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
         local_port: u32,
         guest_cid: u64,
         guest_port: u32,
-        epoll_fd: RawFd,
+        registrar: Arc<Registrar>,
         peer_buf_alloc: u32,
         tx_buffer_size: u32,
     ) -> Self {
@@ -115,7 +120,7 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
             peer_buf_alloc,
             peer_fwd_cnt: Wrapping(0),
             rx_cnt: Wrapping(0),
-            epoll_fd,
+            registrar,
             tx_buf: LocalTxBuf::new(tx_buffer_size),
             tx_buffer_size,
         }
@@ -177,16 +182,16 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
 
                         // Re-register the stream file descriptor for read and write events
                         if VhostUserVsockThread::epoll_modify(
-                            self.epoll_fd,
-                            self.stream.as_raw_fd(),
-                            epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
+                            &self.registrar,
+                            self.stream.as_raw_descriptor(),
+                            EventSet::IN | EventSet::OUT,
                         )
                         .is_err()
                         {
                             if let Err(e) = VhostUserVsockThread::epoll_register(
-                                self.epoll_fd,
-                                self.stream.as_raw_fd(),
-                                epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
+                                &self.registrar,
+                                self.stream.as_raw_descriptor(),
+                                EventSet::IN | EventSet::OUT,
                             ) {
                                 // TODO: let's move this logic out of this func, and handle it
                                 // properly
@@ -263,16 +268,16 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
 
                 // Re-register the stream file descriptor for read and write events
                 if VhostUserVsockThread::epoll_modify(
-                    self.epoll_fd,
-                    self.stream.as_raw_fd(),
-                    epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
+                    &self.registrar,
+                    self.stream.as_raw_descriptor(),
+                    EventSet::IN | EventSet::OUT,
                 )
                 .is_err()
                 {
                     if let Err(e) = VhostUserVsockThread::epoll_register(
-                        self.epoll_fd,
-                        self.stream.as_raw_fd(),
-                        epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
+                        &self.registrar,
+                        self.stream.as_raw_descriptor(),
+                        EventSet::IN | EventSet::OUT,
                     ) {
                         // TODO: let's move this logic out of this func, and handle it properly
                         error!("epoll_register failed: {e:?}, but proceed further.");
@@ -348,9 +353,9 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
         if written_count != buf.len() {
             // Try to re-enable EPOLLOUT in case it is disabled when txbuf is empty.
             if VhostUserVsockThread::epoll_modify(
-                self.epoll_fd,
-                self.stream.as_raw_fd(),
-                epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
+                &self.registrar,
+                self.stream.as_raw_descriptor(),
+                EventSet::IN | EventSet::OUT,
             )
             .is_err()
             {
@@ -394,6 +399,7 @@ impl<S: AsRawFd + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockCon
 
 #[cfg(test)]
 mod tests {
+    use vmm_sys_util::epoll::Epoll;
     use std::{
         collections::VecDeque,
         io::{Read, Result as IoResult},
@@ -609,8 +615,8 @@ mod tests {
         }
     }
 
-    impl AsRawFd for VsockDummySocket {
-        fn as_raw_fd(&self) -> RawFd {
+    impl AsRawDescriptor for VsockDummySocket {
+        fn as_raw_descriptor(&self) -> crate::platform::RawDescriptor {
             -1
         }
     }
@@ -632,7 +638,7 @@ mod tests {
             5000,
             3,
             5001,
-            -1,
+            Arc::new(Registrar::with_epoll(Arc::new(Epoll::new().unwrap()))),
             CONN_TX_BUF_SIZE,
         );
 
@@ -655,7 +661,7 @@ mod tests {
             5000,
             3,
             5001,
-            -1,
+            Arc::new(Registrar::with_epoll(Arc::new(Epoll::new().unwrap()))),
             65536,
             CONN_TX_BUF_SIZE,
         );
@@ -680,7 +686,7 @@ mod tests {
             5000,
             3,
             5001,
-            -1,
+            Arc::new(Registrar::with_epoll(Arc::new(Epoll::new().unwrap()))),
             CONN_TX_BUF_SIZE,
         );
 
@@ -712,7 +718,7 @@ mod tests {
             5000,
             3,
             5001,
-            -1,
+            Arc::new(Registrar::with_epoll(Arc::new(Epoll::new().unwrap()))),
             CONN_TX_BUF_SIZE,
         );
 
@@ -747,7 +753,7 @@ mod tests {
             5000,
             3,
             5001,
-            -1,
+            Arc::new(Registrar::with_epoll(Arc::new(Epoll::new().unwrap()))),
             CONN_TX_BUF_SIZE,
         );
 
@@ -845,7 +851,7 @@ mod tests {
             5000,
             3,
             5001,
-            -1,
+            Arc::new(Registrar::with_epoll(Arc::new(Epoll::new().unwrap()))),
             CONN_TX_BUF_SIZE,
         );
 
@@ -897,5 +903,68 @@ mod tests {
         let shutdown_response = conn_local.send_pkt(&pkt);
         shutdown_response.unwrap();
         assert!(conn_local.rx_queue.contains(RxOps::Reset.bitmask()));
+    }
+
+    /// The RW path over the stream production actually uses.
+    ///
+    /// `test_vsock_conn_recv_pkt` covers the same operation, but over a
+    /// `VsockDummySocket` that implements `ReadVolatile` itself. That skips
+    /// `StreamType`, and with it the platform read path a real host
+    /// connection goes through -- which on Windows is a different
+    /// implementation entirely. This drives the same forwarding over a real
+    /// connected pair, so what the guest would receive is what is asserted.
+    #[test]
+    fn recv_pkt_forwards_host_bytes_over_a_real_stream() {
+        use crate::platform::{UnixListener, UnixStream};
+        use crate::thread_backend::StreamType;
+
+        let head_params = HeadParams::new(PKT_HEADER_SIZE, 5);
+
+        let path = std::env::temp_dir().join(format!(
+            "vhost-device-vsock-recv-real-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let mut host = UnixStream::connect(&path).unwrap();
+        let (backend, _) = listener.accept().unwrap();
+
+        let mut conn = VsockConnection::new_local_init(
+            StreamType::Unix(backend),
+            VSOCK_HOST_CID,
+            5000,
+            3,
+            5001,
+            Arc::new(Registrar::with_epoll(Arc::new(Epoll::new().unwrap()))),
+            CONN_TX_BUF_SIZE,
+        );
+        // An established connection with room at the peer, which is the
+        // state the guest has put it in by the time data comes back.
+        conn.connect = true;
+        conn.peer_buf_alloc = 65536;
+
+        let (mem, mut descr_chain) = prepare_desc_chain_vsock(true, &head_params, 1, 5);
+        let mem = mem.memory();
+        let mut pkt =
+            VsockPacket::from_rx_virtq_chain(mem.deref(), &mut descr_chain, CONN_TX_BUF_SIZE)
+                .unwrap();
+
+        host.write_all(b"hello").unwrap();
+        conn.rx_queue.enqueue(RxOps::Rw);
+        conn.recv_pkt(&mut pkt).unwrap();
+
+        assert_eq!(pkt.op(), VSOCK_OP_RW, "host data should arrive as RW");
+        assert_eq!(pkt.len(), 5);
+        let buf = &mut [0u8; 5];
+        pkt.data_slice().unwrap().read_slice(buf, 0).unwrap();
+        assert_eq!(buf, b"hello", "the bytes the host wrote should reach the guest");
+        assert_eq!(conn.rx_cnt, Wrapping(5));
+
+        // The stream is registered by recv_pkt; remove it before it closes.
+        let _ = VhostUserVsockThread::epoll_unregister(
+            &conn.registrar,
+            conn.stream.as_raw_descriptor(),
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

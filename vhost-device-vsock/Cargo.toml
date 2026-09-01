@@ -18,7 +18,6 @@ xen = ["vm-memory/xen", "vhost/xen", "vhost-user-backend/xen"]
 byteorder = "1"
 clap = { version = "4.6",  features = ["derive"] }
 env_logger = "0.11"
-epoll = "4.4.0"
 log = "0.4"
 thiserror = "2.0"
 vhost = { workspace = true }
@@ -29,9 +28,22 @@ virtio-vsock = "0.12"
 vm-memory = { workspace = true }
 vmm-sys-util = { workspace = true }
 figment = { version = "0.10.19", features = ["yaml"] }
+serde = { version = "1", features = ["derive"] }
+
+# The host-side vsock backend needs AF_VSOCK, which is Linux only. But
+# `backend_vsock` is a default feature, so on Windows the feature is on while
+# these crates are absent. The code gates on `all(feature = "backend_vsock",
+# unix)` everywhere to cope, which keeps a plain `cargo build` working on
+# Windows. On Unix that condition means the same as the feature alone.
+[target.'cfg(unix)'.dependencies]
 vsock = { version = "0.5.4", optional = true }
 libc = { version = "0.2.186", optional = true }
-serde = { version = "1", features = ["derive"] }
+
+# std has no UnixStream on Windows even though the OS has had AF_UNIX
+# since 1803.
+[target.'cfg(windows)'.dependencies]
+uds_windows = "1.1"
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
 
 [dev-dependencies]
 assert_matches = "1.5"

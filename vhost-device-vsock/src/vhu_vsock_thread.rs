@@ -2,15 +2,11 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    fs::File,
-    io::{self, BufRead, BufReader},
+    io::{BufRead, BufReader},
     iter::FromIterator,
     num::Wrapping,
     ops::Deref,
-    os::unix::{
-        net::{UnixListener, UnixStream},
-        prelude::{AsRawFd, FromRawFd, RawFd},
-    },
+
     sync::{
         mpsc::{self, Sender},
         Arc, RwLock,
@@ -27,14 +23,17 @@ use vmm_sys_util::{
     epoll::EventSet,
     eventfd::{EventFd, EFD_NONBLOCK},
 };
-#[cfg(feature = "backend_vsock")]
+
+use crate::platform::{AsRawDescriptor, RawDescriptor, UnixListener, UnixStream};
+#[cfg(all(feature = "backend_vsock", unix))]
 use vsock::{VsockListener, VMADDR_CID_ANY};
 
 use crate::{
+    registrar::Registrar,
     rxops::*,
     thread_backend::*,
     vhu_vsock::{
-        BackendType, CidMap, ConnMapKey, Error, Result, VhostUserVsockBackend, BACKEND_EVENT,
+        BackendType, CidMap, ConnMapKey, Error, Result, VhostUserVsockBackend,
         SIBLING_VM_EVENT, VSOCK_HOST_CID,
     },
     vsock_conn::*,
@@ -57,7 +56,7 @@ struct EventData {
 
 enum ListenerType {
     Unix(UnixListener),
-    #[cfg(feature = "backend_vsock")]
+    #[cfg(all(feature = "backend_vsock", unix))]
     Vsock(VsockListener),
 }
 
@@ -67,10 +66,14 @@ pub(crate) struct VhostUserVsockThread {
     /// VIRTIO_RING_F_EVENT_IDX.
     pub event_idx: bool,
     backend_info: BackendType,
+    /// Where host descriptors are registered.
+    ///
+    /// Must stay declared above every field that owns a descriptor it
+    /// watches. Fields drop in declaration order, and closing a descriptor
+    /// that is still registered kills the process on Windows.
+    registrar: Arc<Registrar>,
     /// Host socket raw file descriptor and listener.
-    host_listeners_map: HashMap<i32, ListenerType>,
-    /// epoll fd to which new host connections are added.
-    epoll_file: File,
+    host_listeners_map: HashMap<RawDescriptor, ListenerType>,
     /// VsockThreadBackend instance.
     pub thread_backend: VsockThreadBackend,
     /// CID of the guest.
@@ -108,24 +111,24 @@ impl VhostUserVsockThread {
                 let host_listener = UnixListener::bind(uds_path)
                     .and_then(|sock| sock.set_nonblocking(true).map(|_| sock))
                     .map_err(Error::UnixBind)?;
-                let host_sock = host_listener.as_raw_fd();
+                let host_sock = host_listener.as_raw_descriptor();
                 host_listeners_map.insert(host_sock, ListenerType::Unix(host_listener));
             }
-            #[cfg(feature = "backend_vsock")]
+            #[cfg(all(feature = "backend_vsock", unix))]
             BackendType::Vsock(vsock_info) => {
                 for p in &vsock_info.listen_ports {
                     let host_listener = VsockListener::bind_with_cid_port(VMADDR_CID_ANY, *p)
                         .and_then(|sock| sock.set_nonblocking(true).map(|_| sock))
                         .map_err(Error::VsockBind)?;
-                    let host_sock = host_listener.as_raw_fd();
+                    let host_sock = host_listener.as_raw_descriptor();
                     host_listeners_map.insert(host_sock, ListenerType::Vsock(host_listener));
                 }
             }
         }
 
-        let epoll_fd = epoll::create(true).map_err(Error::EpollFdCreate)?;
-        // SAFETY: Safe as the fd is guaranteed to be valid here.
-        let epoll_file = unsafe { File::from_raw_fd(epoll_fd) };
+        // The backend's event loop arrives later, in `register_listeners`.
+        // Until then the registrar just records what is registered.
+        let registrar = Arc::new(Registrar::pending());
 
         let mut groups = groups;
         let groups_set: Arc<RwLock<HashSet<String>>> =
@@ -135,7 +138,7 @@ impl VhostUserVsockThread {
 
         let thread_backend = VsockThreadBackend::new(
             backend_info.clone(),
-            epoll_fd,
+            registrar.clone(),
             guest_cid,
             tx_buffer_size,
             groups_set.clone(),
@@ -171,8 +174,8 @@ impl VhostUserVsockThread {
             mem: None,
             event_idx: false,
             backend_info: backend_info.clone(),
+            registrar: registrar.clone(),
             host_listeners_map,
-            epoll_file,
             thread_backend,
             guest_cid,
             sender,
@@ -183,7 +186,7 @@ impl VhostUserVsockThread {
         };
 
         for host_raw_fd in thread.host_listeners_map.keys() {
-            VhostUserVsockThread::epoll_register(epoll_fd, *host_raw_fd, epoll::Events::EPOLLIN)?;
+            VhostUserVsockThread::epoll_register(&registrar, *host_raw_fd, EventSet::IN)?;
         }
 
         Ok(thread)
@@ -220,91 +223,62 @@ impl VhostUserVsockThread {
             event_data.vring.signal_used_queue().unwrap();
         }
     }
-    /// Register a file with an epoll to listen for events in evset.
-    pub fn epoll_register(epoll_fd: RawFd, fd: RawFd, evset: epoll::Events) -> Result<()> {
-        epoll::ctl(
-            epoll_fd,
-            epoll::ControlOptions::EPOLL_CTL_ADD,
-            fd,
-            epoll::Event::new(evset, fd as u64),
-        )
-        .map_err(Error::EpollAdd)?;
-
-        Ok(())
+    /// Watch a descriptor for events in evset.
+    pub fn epoll_register(
+        registrar: &Registrar,
+        fd: RawDescriptor,
+        evset: EventSet,
+    ) -> Result<()> {
+        registrar.register(fd, evset)
     }
 
-    /// Remove a file from the epoll.
-    pub fn epoll_unregister(epoll_fd: RawFd, fd: RawFd) -> Result<()> {
-        epoll::ctl(
-            epoll_fd,
-            epoll::ControlOptions::EPOLL_CTL_DEL,
-            fd,
-            epoll::Event::new(epoll::Events::empty(), 0),
-        )
-        .map_err(Error::EpollRemove)?;
-
-        Ok(())
+    /// Stop watching a descriptor.
+    pub fn epoll_unregister(registrar: &Registrar, fd: RawDescriptor) -> Result<()> {
+        registrar.unregister(fd)
     }
 
-    /// Modify the events we listen to for the fd in the epoll.
-    pub fn epoll_modify(epoll_fd: RawFd, fd: RawFd, evset: epoll::Events) -> Result<()> {
-        epoll::ctl(
-            epoll_fd,
-            epoll::ControlOptions::EPOLL_CTL_MOD,
-            fd,
-            epoll::Event::new(evset, fd as u64),
-        )
-        .map_err(Error::EpollModify)?;
-
-        Ok(())
+    /// Change what a descriptor is watched for.
+    pub fn epoll_modify(registrar: &Registrar, fd: RawDescriptor, evset: EventSet) -> Result<()> {
+        registrar.modify(fd, evset)
     }
 
-    /// Return raw file descriptor of the epoll file.
-    fn get_epoll_fd(&self) -> RawFd {
-        self.epoll_file.as_raw_fd()
+    /// Where this thread registers its host descriptors.
+    fn registrar(&self) -> &Registrar {
+        &self.registrar
     }
 
-    /// Register our listeners in the VringEpollHandler
+    /// Give the registrar the backend's event loop, and register the
+    /// sibling-VM doorbell with it.
     pub fn register_listeners(&mut self, epoll_handler: Arc<VringEpollHandler<ArcVhostBknd>>) {
         epoll_handler
-            .register_listener(self.get_epoll_fd(), EventSet::IN, u64::from(BACKEND_EVENT))
-            .unwrap();
-        epoll_handler
             .register_listener(
-                self.sibling_event_fd.as_raw_fd(),
+                self.sibling_event_fd.as_raw_descriptor(),
                 EventSet::IN,
                 u64::from(SIBLING_VM_EVENT),
             )
             .unwrap();
+        self.registrar
+            .attach(Arc::downgrade(&epoll_handler))
+            .unwrap();
     }
 
-    /// Process a BACKEND_EVENT received by VhostUserVsockBackend.
-    pub fn process_backend_evt(&mut self, _evset: EventSet) {
-        let mut epoll_events = vec![epoll::Event::new(epoll::Events::empty(), 0); 32];
-        'epoll: loop {
-            match epoll::wait(self.epoll_file.as_raw_fd(), 0, epoll_events.as_mut_slice()) {
-                Ok(ev_cnt) => {
-                    for evt in epoll_events.iter().take(ev_cnt) {
-                        self.handle_event(
-                            evt.data as RawFd,
-                            epoll::Events::from_bits(evt.events).unwrap(),
-                        );
-                    }
-                }
-                Err(e) => {
-                    if e.kind() == io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    warn!("failed to consume new epoll event");
-                }
-            }
-            break 'epoll;
-        }
+    /// Handle an event the backend's loop reported for a host descriptor.
+    ///
+    /// `id` is the id the descriptor was registered under, not the descriptor
+    /// itself, so it has to be looked up.
+    pub fn process_host_evt(&mut self, id: u16, evset: EventSet) {
+        let Some(fd) = self.registrar.descriptor_for(id) else {
+            // The descriptor was unregistered after the event was
+            // reported, which happens when a connection closes. Not an
+            // error.
+            return;
+        };
+        self.handle_event(fd, evset);
     }
 
-    /// Handle a BACKEND_EVENT by either accepting a new connection or
-    /// forwarding a request to the appropriate connection object.
-    fn handle_event(&mut self, fd: RawFd, evset: epoll::Events) {
+    /// Accept a new connection, or forward a request to the connection the
+    /// descriptor belongs to.
+    fn handle_event(&mut self, fd: RawDescriptor, evset: EventSet) {
         if let Some(listener) = self.host_listeners_map.get(&fd) {
             // This is a new connection initiated by an application running on the host
             match listener {
@@ -329,7 +303,7 @@ impl VhostUserVsockThread {
                         });
                     }
                 }
-                #[cfg(feature = "backend_vsock")]
+                #[cfg(all(feature = "backend_vsock", unix))]
                 ListenerType::Vsock(vsock_listener) => {
                     let conn = vsock_listener.accept().map_err(Error::VsockAccept);
                     if self.mem.is_some() {
@@ -349,7 +323,7 @@ impl VhostUserVsockThread {
                                 };
 
                                 let local_port = addr.port();
-                                let stream_raw_fd = stream.as_raw_fd();
+                                let stream_raw_fd = stream.as_raw_descriptor();
                                 self.add_new_connection_from_host(
                                     stream_raw_fd,
                                     StreamType::Vsock(stream),
@@ -357,9 +331,9 @@ impl VhostUserVsockThread {
                                     peer_port,
                                 );
                                 if let Err(err) = Self::epoll_register(
-                                    self.get_epoll_fd(),
+                                    self.registrar(),
                                     stream_raw_fd,
-                                    epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
+                                    EventSet::IN | EventSet::OUT,
                                 ) {
                                     warn!("Failed to register with epoll: {err:?}");
                                 }
@@ -382,7 +356,7 @@ impl VhostUserVsockThread {
                 self.thread_backend.listener_map.entry(fd)
             {
                 // New connection from the host
-                if evset.bits() != epoll::Events::EPOLLIN.bits() {
+                if evset.bits() != EventSet::IN.bits() {
                     // Has to be EPOLLIN as it was not connected previously
                     return;
                 }
@@ -395,7 +369,7 @@ impl VhostUserVsockThread {
                 };
 
                 match stream {
-                    #[cfg(feature = "backend_vsock")]
+                    #[cfg(all(feature = "backend_vsock", unix))]
                     StreamType::Vsock(_) => {
                         error!("Stream type should not be of type vsock");
                     }
@@ -422,9 +396,9 @@ impl VhostUserVsockThread {
 
                         // Re-register the fd to listen for EPOLLIN and EPOLLOUT events
                         Self::epoll_modify(
-                            self.get_epoll_fd(),
+                            self.registrar(),
                             fd,
-                            epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
+                            EventSet::IN | EventSet::OUT,
                         )
                         .unwrap();
                     }
@@ -433,11 +407,11 @@ impl VhostUserVsockThread {
                 // Previously connected connection
 
                 // Get epoll fd before getting conn as that takes self mut ref
-                let epoll_fd = self.get_epoll_fd();
+                let registrar = self.registrar.clone();
                 let key = self.thread_backend.listener_map.get(&fd).unwrap();
                 let conn = self.thread_backend.conn_map.get_mut(key).unwrap();
 
-                if evset.bits() == epoll::Events::EPOLLOUT.bits() {
+                if evset.bits() == EventSet::OUT.bits() {
                     // Flush any remaining data from the tx buffer
                     match conn.tx_buf.flush_to(&mut conn.stream) {
                         Ok(cnt) => {
@@ -446,7 +420,7 @@ impl VhostUserVsockThread {
                                 conn.rx_queue.enqueue(RxOps::CreditUpdate);
                             } else {
                                 // If no remaining data to flush, try to disable EPOLLOUT
-                                if Self::epoll_modify(epoll_fd, fd, epoll::Events::EPOLLIN).is_err()
+                                if Self::epoll_modify(&registrar, fd, EventSet::IN).is_err()
                                 {
                                     error!("Failed to disable EPOLLOUT");
                                 }
@@ -464,7 +438,7 @@ impl VhostUserVsockThread {
 
                 // Unregister stream from the epoll, register when connection is
                 // established with the guest
-                Self::epoll_unregister(self.epoll_file.as_raw_fd(), fd).unwrap();
+                Self::epoll_unregister(&registrar, fd).unwrap();
 
                 // Enqueue a read request
                 conn.rx_queue.enqueue(RxOps::Rw);
@@ -477,7 +451,7 @@ impl VhostUserVsockThread {
 
     fn add_new_connection_from_host(
         &mut self,
-        fd: RawFd,
+        fd: RawDescriptor,
         stream: StreamType,
         local_port: u32,
         peer_port: u32,
@@ -496,7 +470,7 @@ impl VhostUserVsockThread {
             local_port,
             self.guest_cid,
             peer_port,
-            self.get_epoll_fd(),
+            self.registrar.clone(),
             self.tx_buffer_size,
         );
         new_conn.rx_queue.enqueue(RxOps::Request);
@@ -566,14 +540,14 @@ impl VhostUserVsockThread {
 
     /// Add a stream to epoll to listen for EPOLLIN events.
     fn add_stream_listener(&mut self, stream: UnixStream) -> Result<()> {
-        let stream_fd = stream.as_raw_fd();
+        let stream_fd = stream.as_raw_descriptor();
         self.thread_backend
             .stream_map
             .insert(stream_fd, StreamType::Unix(stream));
         VhostUserVsockThread::epoll_register(
-            self.get_epoll_fd(),
+            self.registrar(),
             stream_fd,
-            epoll::Events::EPOLLIN,
+            EventSet::IN,
         )?;
 
         Ok(())
@@ -804,7 +778,7 @@ impl Drop for VhostUserVsockThread {
             BackendType::UnixDomainSocket(uds_path) => {
                 let _ = std::fs::remove_file(uds_path);
             }
-            #[cfg(feature = "backend_vsock")]
+            #[cfg(all(feature = "backend_vsock", unix))]
             BackendType::Vsock(_) => {
                 // Nothing to do
             }
@@ -827,18 +801,20 @@ mod tests {
     use tempfile::tempdir;
     use vm_memory::GuestAddress;
     use vmm_sys_util::eventfd::EventFd;
-    #[cfg(feature = "backend_vsock")]
+    #[cfg(all(feature = "backend_vsock", unix))]
     use vsock::{VsockStream, VMADDR_CID_LOCAL};
 
     use super::*;
-    #[cfg(feature = "backend_vsock")]
+    use crate::registrar::FIRST_HOST_EVENT;
+    use vmm_sys_util::epoll::Epoll;
+    #[cfg(all(feature = "backend_vsock", unix))]
     use crate::vhu_vsock::VsockProxyInfo;
 
     const CONN_TX_BUF_SIZE: u32 = 64 * 1024;
 
     impl VhostUserVsockThread {
-        fn get_epoll_file(&self) -> &File {
-            &self.epoll_file
+        fn get_registrar(&self) -> Arc<Registrar> {
+            self.registrar.clone()
         }
     }
 
@@ -851,7 +827,7 @@ mod tests {
         assert!(t.is_ok());
 
         let mut t = t.unwrap();
-        let epoll_fd = t.get_epoll_file().as_raw_fd();
+        let registrar = t.get_registrar();
 
         let mem = GuestMemoryAtomic::new(
             GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
@@ -861,21 +837,31 @@ mod tests {
 
         let dummy_fd = EventFd::new(0).unwrap();
 
-        VhostUserVsockThread::epoll_register(
-            epoll_fd,
-            dummy_fd.as_raw_fd(),
-            epoll::Events::EPOLLOUT,
-        )
-        .unwrap();
-        VhostUserVsockThread::epoll_modify(epoll_fd, dummy_fd.as_raw_fd(), epoll::Events::EPOLLIN)
+        // What this covers is register/modify/unregister/register. The set it
+        // starts in is incidental, and cannot be the same on both hosts: an
+        // EventFd is a handle, and a Windows Epoll reports readability only
+        // for those -- there is nothing to wait for on a doorbell becoming
+        // writable, so asking is refused rather than accepted and never
+        // reported.
+        #[cfg(unix)]
+        let initial = EventSet::OUT;
+        #[cfg(windows)]
+        let initial = EventSet::IN;
+
+        VhostUserVsockThread::epoll_register(&registrar, dummy_fd.as_raw_descriptor(), initial)
             .unwrap();
-        VhostUserVsockThread::epoll_unregister(epoll_fd, dummy_fd.as_raw_fd()).unwrap();
-        VhostUserVsockThread::epoll_register(
-            epoll_fd,
-            dummy_fd.as_raw_fd(),
-            epoll::Events::EPOLLIN,
-        )
-        .unwrap();
+        VhostUserVsockThread::epoll_modify(&registrar, dummy_fd.as_raw_descriptor(), EventSet::IN)
+            .unwrap();
+        VhostUserVsockThread::epoll_unregister(&registrar, dummy_fd.as_raw_descriptor()).unwrap();
+        VhostUserVsockThread::epoll_register(&registrar, dummy_fd.as_raw_descriptor(), EventSet::IN)
+            .unwrap();
+        // Registered handles have to be removed before they are closed.
+        // Closing first implicitly removes an fd from a Linux epoll, so
+        // leaving this to the drop below is harmless there; on Windows it
+        // leaves a thread-pool wait on a closed handle and takes the
+        // process down.
+        VhostUserVsockThread::epoll_unregister(&registrar, dummy_fd.as_raw_descriptor())
+            .unwrap();
 
         let vring = VringRwLock::new(mem, 0x1000).unwrap();
         vring.set_queue_info(0x100, 0x200, 0x300).unwrap();
@@ -907,7 +893,9 @@ mod tests {
 
         dummy_fd.write(1).unwrap();
 
-        t.process_backend_evt(EventSet::empty());
+        // An id for a descriptor that is not registered is ignored rather
+        // than dispatched: a connection can close under a pending event.
+        t.process_host_evt(FIRST_HOST_EVENT, EventSet::IN);
     }
 
     #[test]
@@ -919,7 +907,7 @@ mod tests {
         test_dir.close().unwrap();
     }
 
-    #[cfg(feature = "backend_vsock")]
+    #[cfg(all(feature = "backend_vsock", unix))]
     #[test]
     fn test_vsock_thread_vsock() {
         let backend_info = BackendType::Vsock(VsockProxyInfo {
@@ -955,9 +943,12 @@ mod tests {
             cid_map.clone(),
         )
         .unwrap();
-        assert!(VhostUserVsockThread::epoll_register(-1, -1, epoll::Events::EPOLLIN).is_err());
-        assert!(VhostUserVsockThread::epoll_modify(-1, -1, epoll::Events::EPOLLIN).is_err());
-        assert!(VhostUserVsockThread::epoll_unregister(-1, -1).is_err());
+        // A descriptor that names nothing must be refused rather than
+        // registered, on either host.
+        let bad = Registrar::with_epoll(Arc::new(Epoll::new().unwrap()));
+        assert!(VhostUserVsockThread::epoll_register(&bad, -1, EventSet::IN).is_err());
+        assert!(VhostUserVsockThread::epoll_modify(&bad, -1, EventSet::IN).is_err());
+        assert!(VhostUserVsockThread::epoll_unregister(&bad, -1).is_err());
 
         let mem = GuestMemoryAtomic::new(
             GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
@@ -1015,10 +1006,16 @@ mod tests {
         t.mem = Some(mem.clone());
 
         let mut uds = UnixStream::connect(vsock_path).unwrap();
-        t.process_backend_evt(EventSet::empty());
 
+        // What the backend's event loop would report: the host listener is
+        // readable, so there is a connection to accept.
+        let listener_fd = *t.host_listeners_map.keys().next().unwrap();
+        t.handle_event(listener_fd, EventSet::IN);
+
+        // Then the accepted stream is readable, carrying the connect command.
+        let stream_fd = *t.thread_backend.stream_map.keys().next().unwrap();
         uds.write_all(b"CONNECT 1234\n").unwrap();
-        t.process_backend_evt(EventSet::empty());
+        t.handle_event(stream_fd, EventSet::IN);
 
         // Write and read something from the Unix socket
         uds.write_all(b"some data").unwrap();
@@ -1028,12 +1025,12 @@ mod tests {
         // There isn't any peer responding, so we don't expect data
         uds.read(&mut buf).unwrap_err();
 
-        t.process_backend_evt(EventSet::empty());
+        t.handle_event(stream_fd, EventSet::IN);
 
         test_dir.close().unwrap();
     }
 
-    #[cfg(feature = "backend_vsock")]
+    #[cfg(all(feature = "backend_vsock", unix))]
     #[test]
     fn test_vsock_thread_vsock_backend() {
         VsockListener::bind_with_cid_port(VMADDR_CID_LOCAL, libc::VMADDR_PORT_ANY).expect(
@@ -1078,5 +1075,66 @@ mod tests {
         vs2.read(&mut buf).unwrap_err();
 
         t.process_backend_evt(EventSet::empty());
+    }
+
+    /// The registration lifecycle a host connection goes through.
+    ///
+    /// `handle_event` unregisters an established stream and leaves it to the
+    /// next `recv_pkt` to put it back, which it does by trying `epoll_modify`
+    /// and falling back to `epoll_register` when that reports the stream is
+    /// not registered. The whole cycle therefore rests on `modify` failing
+    /// -- and failing rather than quietly succeeding -- once a stream has
+    /// been unregistered. This asserts that on a real socket.
+    #[test]
+    fn a_stream_can_be_unregistered_and_registered_again() {
+        use crate::platform::{UnixListener, UnixStream};
+
+        let path = std::env::temp_dir().join(format!(
+            "vhost-device-vsock-lifecycle-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = UnixStream::connect(&path).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let fd = server.as_raw_descriptor();
+
+        let registrar = Registrar::with_epoll(Arc::new(Epoll::new().unwrap()));
+
+        // As a guest-initiated connection is registered.
+        VhostUserVsockThread::epoll_register(&registrar, fd, EventSet::IN | EventSet::OUT).unwrap();
+        // Registering twice is refused, which is what makes the fallback
+        // below meaningful rather than accidentally idempotent.
+        assert!(
+            VhostUserVsockThread::epoll_register(&registrar, fd, EventSet::IN).is_err(),
+            "a second registration of the same stream must be refused"
+        );
+
+        // As the tx buffer draining narrows it.
+        VhostUserVsockThread::epoll_modify(&registrar, fd, EventSet::IN).unwrap();
+
+        // As handle_event drops it once the guest is to be told.
+        VhostUserVsockThread::epoll_unregister(&registrar, fd).unwrap();
+
+        // recv_pkt's first move, which must now fail: if it were to succeed
+        // the stream would never be registered again and readiness on it
+        // would stop being observed entirely.
+        assert!(
+            VhostUserVsockThread::epoll_modify(&registrar, fd, EventSet::IN | EventSet::OUT).is_err(),
+            "modify must report an unregistered stream, or the fallback never runs"
+        );
+
+        // recv_pkt's fallback, restoring the cycle.
+        VhostUserVsockThread::epoll_register(&registrar, fd, EventSet::IN | EventSet::OUT).unwrap();
+
+        // And it really is registered again.
+        assert!(
+            VhostUserVsockThread::epoll_register(&registrar, fd, EventSet::IN).is_err(),
+            "the stream should be registered again after the fallback"
+        );
+
+        drop(client);
+        VhostUserVsockThread::epoll_unregister(&registrar, fd).unwrap();
+        let _ = std::fs::remove_file(&path);
     }
 }

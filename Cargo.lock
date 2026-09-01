@@ -2441,13 +2441,13 @@ dependencies = [
  "byteorder",
  "clap",
  "env_logger",
- "epoll",
  "figment",
  "libc",
  "log",
  "serde",
  "tempfile",
  "thiserror 2.0.18",
+ "uds_windows",
  "vhost",
  "vhost-user-backend",
  "virtio-bindings",
@@ -2456,6 +2456,7 @@ dependencies = [
  "vm-memory",
  "vmm-sys-util",
  "vsock",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

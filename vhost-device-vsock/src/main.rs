@@ -37,6 +37,8 @@
 //! - [`vhu_vsock`]
 //!   - Exposes the main vhost-user vsock backend interface.
 
+mod platform;
+mod registrar;
 mod rxops;
 mod rxqueue;
 mod thread_backend;
@@ -66,7 +68,7 @@ use thiserror::Error as ThisError;
 use vhost_user_backend::VhostUserDaemon;
 use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
 
-#[cfg(feature = "backend_vsock")]
+#[cfg(all(feature = "backend_vsock", unix))]
 use crate::vhu_vsock::VsockProxyInfo;
 use crate::vhu_vsock::{BackendType, CidMap, VhostUserVsockBackend, VsockConfig};
 
@@ -125,12 +127,12 @@ struct VsockParam {
     socket: PathBuf,
 
     /// Unix socket to which a host-side application connects to.
-    #[cfg(not(feature = "backend_vsock"))]
+    #[cfg(not(all(feature = "backend_vsock", unix)))]
     #[arg(long, conflicts_with = "config", conflicts_with = "vm")]
     uds_path: Option<PathBuf>,
 
     /// Unix socket to which a host-side application connects to.
-    #[cfg(feature = "backend_vsock")]
+    #[cfg(all(feature = "backend_vsock", unix))]
     #[arg(
         long,
         conflicts_with = "forward_cid",
@@ -141,7 +143,7 @@ struct VsockParam {
     uds_path: Option<PathBuf>,
 
     /// The vsock CID to forward connections from guest
-    #[cfg(feature = "backend_vsock")]
+    #[cfg(all(feature = "backend_vsock", unix))]
     #[clap(
         long,
         conflicts_with = "uds_path",
@@ -151,7 +153,7 @@ struct VsockParam {
     forward_cid: Option<u32>,
 
     /// The vsock ports to forward connections from host
-    #[cfg(feature = "backend_vsock")]
+    #[cfg(all(feature = "backend_vsock", unix))]
     #[clap(
         long,
         conflicts_with = "uds_path",
@@ -186,9 +188,9 @@ struct ConfigFileVsockParam {
     guest_cid: Option<u64>,
     socket: PathBuf,
     uds_path: Option<PathBuf>,
-    #[cfg(feature = "backend_vsock")]
+    #[cfg(all(feature = "backend_vsock", unix))]
     forward_cid: Option<u32>,
-    #[cfg(feature = "backend_vsock")]
+    #[cfg(all(feature = "backend_vsock", unix))]
     forward_listen: Option<String>,
     tx_buffer_size: Option<u32>,
     queue_size: Option<usize>,
@@ -213,7 +215,7 @@ struct VsockArgs {
     ///
     /// Multiple instances of this argument can be provided to configure devices
     /// for multiple guests.
-    #[cfg(not(feature = "backend_vsock"))]
+    #[cfg(not(all(feature = "backend_vsock", unix)))]
     #[arg(long, conflicts_with = "config", verbatim_doc_comment, value_parser = parse_vm_params)]
     vm: Option<Vec<VsockConfig>>,
 
@@ -234,7 +236,7 @@ struct VsockArgs {
     ///
     /// Multiple instances of this argument can be provided to configure devices
     /// for multiple guests.
-    #[cfg(feature = "backend_vsock")]
+    #[cfg(all(feature = "backend_vsock", unix))]
     #[arg(long, conflicts_with = "config", verbatim_doc_comment, value_parser = parse_vm_params)]
     vm: Option<Vec<VsockConfig>>,
 
@@ -251,9 +253,9 @@ fn parse_vm_params(s: &str) -> Result<VsockConfig, VmArgsParseError> {
     let mut queue_size = None;
     let mut groups = None;
 
-    #[cfg(feature = "backend_vsock")]
+    #[cfg(all(feature = "backend_vsock", unix))]
     let mut forward_cid = None;
-    #[cfg(feature = "backend_vsock")]
+    #[cfg(all(feature = "backend_vsock", unix))]
     let mut forward_listen: Option<Vec<u32>> = None;
 
     for arg in s.trim().split(',') {
@@ -268,11 +270,11 @@ fn parse_vm_params(s: &str) -> Result<VsockConfig, VmArgsParseError> {
             "socket" => socket = Some(PathBuf::from(val)),
             "uds_path" | "uds-path" => uds_path = Some(PathBuf::from(val)),
 
-            #[cfg(feature = "backend_vsock")]
+            #[cfg(all(feature = "backend_vsock", unix))]
             "forward_cid" | "forward-cid" => {
                 forward_cid = Some(val.parse().map_err(VmArgsParseError::ParseInteger)?)
             }
-            #[cfg(feature = "backend_vsock")]
+            #[cfg(all(feature = "backend_vsock", unix))]
             "forward_listen" | "forward-listen" => {
                 forward_listen = Some(val.split('+').map(|s| s.parse().unwrap()).collect())
             }
@@ -288,7 +290,7 @@ fn parse_vm_params(s: &str) -> Result<VsockConfig, VmArgsParseError> {
         }
     }
 
-    #[cfg(feature = "backend_vsock")]
+    #[cfg(all(feature = "backend_vsock", unix))]
     let backend_info = match (uds_path, forward_cid) {
         (Some(path), None) => BackendType::UnixDomainSocket(path),
         (None, Some(cid)) => {
@@ -310,7 +312,7 @@ fn parse_vm_params(s: &str) -> Result<VsockConfig, VmArgsParseError> {
         }
     };
 
-    #[cfg(not(feature = "backend_vsock"))]
+    #[cfg(not(all(feature = "backend_vsock", unix)))]
     let backend_info = match uds_path {
         Some(path) => BackendType::UnixDomainSocket(path),
         _ => {
@@ -342,7 +344,7 @@ impl VsockArgs {
                 if !vms_param.is_empty() {
                     let mut parsed = Vec::new();
                     for p in vms_param.drain(..) {
-                        #[cfg(feature = "backend_vsock")]
+                        #[cfg(all(feature = "backend_vsock", unix))]
                         let backend_info = match (p.uds_path, p.forward_cid) {
                             (Some(path), None) => BackendType::UnixDomainSocket(path),
                             (None, Some(cid)) => {
@@ -360,7 +362,7 @@ impl VsockArgs {
                             _ => return Some(Err(CliError::ConfigParse)),
                         };
 
-                        #[cfg(not(feature = "backend_vsock"))]
+                        #[cfg(not(all(feature = "backend_vsock", unix)))]
                         let backend_info = match p.uds_path {
                             Some(path) => BackendType::UnixDomainSocket(path),
                             _ => return Some(Err(CliError::ConfigParse)),
@@ -401,7 +403,7 @@ impl TryFrom<VsockArgs> for Vec<VsockConfig> {
             _ => match cmd_args.vm {
                 Some(v) => Ok(v),
                 _ => cmd_args.param.map_or(Err(CliError::NoArgsProvided), |p| {
-                    #[cfg(feature = "backend_vsock")]
+                    #[cfg(all(feature = "backend_vsock", unix))]
                     let backend_info = match (p.uds_path, p.forward_cid) {
                         (Some(path), None) => BackendType::UnixDomainSocket(path),
                         (None, Some(cid)) => {
@@ -419,7 +421,7 @@ impl TryFrom<VsockArgs> for Vec<VsockConfig> {
                         _ => return Err(CliError::ConfigParse),
                     };
 
-                    #[cfg(not(feature = "backend_vsock"))]
+                    #[cfg(not(all(feature = "backend_vsock", unix)))]
                     let backend_info = match p.uds_path {
                         Some(path) => BackendType::UnixDomainSocket(path),
                         _ => return Err(CliError::ConfigParse),
@@ -555,9 +557,9 @@ mod tests {
                     socket: socket.to_path_buf(),
                     uds_path: Some(uds_path.to_path_buf()),
 
-                    #[cfg(feature = "backend_vsock")]
+                    #[cfg(all(feature = "backend_vsock", unix))]
                     forward_cid: None,
-                    #[cfg(feature = "backend_vsock")]
+                    #[cfg(all(feature = "backend_vsock", unix))]
                     forward_listen: None,
 
                     tx_buffer_size,
@@ -569,7 +571,7 @@ mod tests {
             }
         }
 
-        #[cfg(feature = "backend_vsock")]
+        #[cfg(all(feature = "backend_vsock", unix))]
         fn from_args_vsock(
             guest_cid: u64,
             socket: &Path,
@@ -632,7 +634,7 @@ mod tests {
         test_dir.close().unwrap();
     }
 
-    #[cfg(feature = "backend_vsock")]
+    #[cfg(all(feature = "backend_vsock", unix))]
     #[test]
     fn test_vsock_config_setup_vsock() {
         let test_dir = tempdir().expect("Could not create a temp test directory.");
@@ -740,7 +742,7 @@ mod tests {
         test_dir.close().unwrap();
     }
 
-    #[cfg(feature = "backend_vsock")]
+    #[cfg(all(feature = "backend_vsock", unix))]
     #[test]
     fn test_vsock_config_setup_from_vm_args_vsock() {
         let test_dir = tempdir().expect("Could not create a temp test directory.");
@@ -910,7 +912,7 @@ mod tests {
         test_dir.close().unwrap();
     }
 
-    #[cfg(feature = "backend_vsock")]
+    #[cfg(all(feature = "backend_vsock", unix))]
     #[test]
     fn test_vsock_config_setup_from_file_vsock() {
         let test_dir = tempdir().expect("Could not create a temp test directory.");
@@ -1034,6 +1036,11 @@ mod tests {
                 .unwrap()
                 .register_listeners(epoll_handlers.remove(0));
         }
+
+        // Dropping the daemon tells its worker threads to exit and waits
+        // for them. A worker that cannot be woken hangs the test here,
+        // which is the point: it covers shutdown, not just set-up.
+        drop(daemon);
     }
 
     #[test]
@@ -1061,7 +1068,7 @@ mod tests {
         test_dir.close().unwrap();
     }
 
-    #[cfg(feature = "backend_vsock")]
+    #[cfg(all(feature = "backend_vsock", unix))]
     #[test]
     fn test_vsock_server_vsock() {
         const CID: u64 = 3;
@@ -1132,7 +1139,7 @@ mod tests {
         let _ = test_dir.close();
     }
 
-    #[cfg(not(feature = "backend_vsock"))]
+    #[cfg(not(all(feature = "backend_vsock", unix)))]
     #[test]
     fn test_main_structs_unix() {
         let error = parse_vm_params("").unwrap_err();
@@ -1166,7 +1173,7 @@ mod tests {
         assert_eq!(format!("{config:?}"), "ConfigFileVsockParam { guest_cid: None, socket: \"\", uds_path: Some(\"\"), tx_buffer_size: None, queue_size: None, groups: None }");
     }
 
-    #[cfg(feature = "backend_vsock")]
+    #[cfg(all(feature = "backend_vsock", unix))]
     #[test]
     fn test_main_structs_vsock() {
         let error = parse_vm_params("").unwrap_err();

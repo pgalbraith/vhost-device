@@ -4,23 +4,25 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::{Read, Result as StdIOResult, Write},
     ops::Deref,
-    os::unix::{
-        net::UnixStream,
-        prelude::{AsRawFd, RawFd},
-    },
     result::Result as StdResult,
     sync::{Arc, RwLock},
 };
 
 use log::{info, warn};
+use vmm_sys_util::epoll::EventSet;
+
+use crate::platform::{
+    stream_read_volatile, stream_write_volatile, AsRawDescriptor, RawDescriptor, UnixStream,
+};
 use virtio_vsock::packet::{VsockPacket, PKT_HEADER_SIZE};
 use vm_memory::{
     bitmap::BitmapSlice, ReadVolatile, VolatileMemoryError, VolatileSlice, WriteVolatile,
 };
-#[cfg(feature = "backend_vsock")]
+#[cfg(all(feature = "backend_vsock", unix))]
 use vsock::VsockStream;
 
 use crate::{
+    registrar::Registrar,
     rxops::*,
     vhu_vsock::{
         BackendType, CidMap, ConnMapKey, Error, Result, VSOCK_HOST_CID, VSOCK_OP_REQUEST,
@@ -57,7 +59,7 @@ impl RawVsockPacket {
 
 pub(crate) enum StreamType {
     Unix(UnixStream),
-    #[cfg(feature = "backend_vsock")]
+    #[cfg(all(feature = "backend_vsock", unix))]
     Vsock(VsockStream),
 }
 
@@ -68,7 +70,7 @@ impl StreamType {
                 let cloned_stream = stream.try_clone()?;
                 Ok(StreamType::Unix(cloned_stream))
             }
-            #[cfg(feature = "backend_vsock")]
+            #[cfg(all(feature = "backend_vsock", unix))]
             StreamType::Vsock(stream) => {
                 let cloned_stream = stream.try_clone()?;
                 Ok(StreamType::Vsock(cloned_stream))
@@ -81,7 +83,7 @@ impl Read for StreamType {
     fn read(&mut self, buf: &mut [u8]) -> StdIOResult<usize> {
         match self {
             StreamType::Unix(stream) => stream.read(buf),
-            #[cfg(feature = "backend_vsock")]
+            #[cfg(all(feature = "backend_vsock", unix))]
             StreamType::Vsock(stream) => stream.read(buf),
         }
     }
@@ -91,7 +93,7 @@ impl Write for StreamType {
     fn write(&mut self, buf: &[u8]) -> StdIOResult<usize> {
         match self {
             StreamType::Unix(stream) => stream.write(buf),
-            #[cfg(feature = "backend_vsock")]
+            #[cfg(all(feature = "backend_vsock", unix))]
             StreamType::Vsock(stream) => stream.write(buf),
         }
     }
@@ -99,18 +101,18 @@ impl Write for StreamType {
     fn flush(&mut self) -> StdIOResult<()> {
         match self {
             StreamType::Unix(stream) => stream.flush(),
-            #[cfg(feature = "backend_vsock")]
+            #[cfg(all(feature = "backend_vsock", unix))]
             StreamType::Vsock(stream) => stream.flush(),
         }
     }
 }
 
-impl AsRawFd for StreamType {
-    fn as_raw_fd(&self) -> RawFd {
+impl AsRawDescriptor for StreamType {
+    fn as_raw_descriptor(&self) -> RawDescriptor {
         match self {
-            StreamType::Unix(stream) => stream.as_raw_fd(),
-            #[cfg(feature = "backend_vsock")]
-            StreamType::Vsock(stream) => stream.as_raw_fd(),
+            StreamType::Unix(stream) => stream.as_raw_descriptor(),
+            #[cfg(all(feature = "backend_vsock", unix))]
+            StreamType::Vsock(stream) => stream.as_raw_descriptor(),
         }
     }
 }
@@ -121,16 +123,16 @@ impl ReadVolatile for StreamType {
         buf: &mut VolatileSlice<'_, B>,
     ) -> StdResult<usize, VolatileMemoryError> {
         match self {
-            StreamType::Unix(stream) => stream.read_volatile(buf),
+            StreamType::Unix(stream) => stream_read_volatile(stream, buf),
             // Copied from vm_memory crate's ReadVolatile implementation for UnixStream
-            #[cfg(feature = "backend_vsock")]
+            #[cfg(all(feature = "backend_vsock", unix))]
             StreamType::Vsock(stream) => {
-                let fd = stream.as_raw_fd();
+                let fd = stream.as_raw_descriptor();
                 let guard = buf.ptr_guard_mut();
 
                 let dst = guard.as_ptr().cast::<libc::c_void>();
 
-                // SAFETY: We got a valid file descriptor from `AsRawFd`. The memory pointed to
+                // SAFETY: We got a valid file descriptor from `AsRawDescriptor`. The memory pointed to
                 // by `dst` is valid for writes of length `buf.len() by the
                 // invariants upheld by the constructor of `VolatileSlice`.
                 let bytes_read = unsafe { libc::read(fd, dst, buf.len()) };
@@ -157,16 +159,16 @@ impl WriteVolatile for StreamType {
         buf: &VolatileSlice<'_, B>,
     ) -> StdResult<usize, VolatileMemoryError> {
         match self {
-            StreamType::Unix(stream) => stream.write_volatile(buf),
+            StreamType::Unix(stream) => stream_write_volatile(stream, buf),
             // Copied from vm_memory crate's WriteVolatile implementation for UnixStream
-            #[cfg(feature = "backend_vsock")]
+            #[cfg(all(feature = "backend_vsock", unix))]
             StreamType::Vsock(stream) => {
-                let fd = stream.as_raw_fd();
+                let fd = stream.as_raw_descriptor();
                 let guard = buf.ptr_guard();
 
                 let src = guard.as_ptr().cast::<libc::c_void>();
 
-                // SAFETY: We got a valid file descriptor from `AsRawFd`. The memory pointed to
+                // SAFETY: We got a valid file descriptor from `AsRawDescriptor`. The memory pointed to
                 // by `src` is valid for reads of length `buf.len() by the
                 // invariants upheld by the constructor of `VolatileSlice`.
                 let bytes_written = unsafe { libc::write(fd, src, buf.len()) };
@@ -193,17 +195,17 @@ impl IsHybridVsock for StreamType {
 
 pub(crate) struct VsockThreadBackend {
     /// Map of ConnMapKey objects indexed by raw file descriptors.
-    pub listener_map: HashMap<RawFd, ConnMapKey>,
+    pub listener_map: HashMap<RawDescriptor, ConnMapKey>,
     /// Map of vsock connection objects indexed by ConnMapKey objects.
     pub conn_map: HashMap<ConnMapKey, VsockConnection<StreamType>>,
     /// Queue of ConnMapKey objects indicating pending rx operations.
     pub backend_rxq: VecDeque<ConnMapKey>,
     /// Map of host-side unix or vsock streams indexed by raw file descriptors.
-    pub stream_map: HashMap<i32, StreamType>,
+    pub stream_map: HashMap<RawDescriptor, StreamType>,
     /// Host side socket info for listening to new connections from the host.
     backend_info: BackendType,
-    /// epoll for registering new host-side connections.
-    epoll_fd: i32,
+    /// Where new host-side connections are registered for readiness.
+    registrar: Arc<Registrar>,
     /// CID of the guest.
     guest_cid: u64,
     /// Set of allocated local ports.
@@ -224,7 +226,7 @@ impl VsockThreadBackend {
     /// New instance of VsockThreadBackend.
     pub fn new(
         backend_info: BackendType,
-        epoll_fd: i32,
+        registrar: Arc<Registrar>,
         guest_cid: u64,
         tx_buffer_size: u32,
         groups_set: Arc<RwLock<HashSet<String>>>,
@@ -238,7 +240,7 @@ impl VsockThreadBackend {
             // TODO: think of a better solution
             stream_map: HashMap::new(),
             backend_info,
-            epoll_fd,
+            registrar,
             guest_cid,
             local_port_set: HashSet::new(),
             tx_buffer_size,
@@ -277,14 +279,14 @@ impl VsockThreadBackend {
         if conn.rx_queue.peek() == Some(RxOps::Reset) {
             // Handle RST events here
             let conn = self.conn_map.remove(&key).unwrap();
-            self.listener_map.remove(&conn.stream.as_raw_fd());
-            self.stream_map.remove(&conn.stream.as_raw_fd());
+            self.listener_map.remove(&conn.stream.as_raw_descriptor());
+            self.stream_map.remove(&conn.stream.as_raw_descriptor());
             self.local_port_set.remove(&conn.local_port);
-            VhostUserVsockThread::epoll_unregister(conn.epoll_fd, conn.stream.as_raw_fd())
+            VhostUserVsockThread::epoll_unregister(&conn.registrar, conn.stream.as_raw_descriptor())
                 .unwrap_or_else(|err| {
                     warn!(
                         "Could not remove epoll listener for fd {:?}: {:?}",
-                        conn.stream.as_raw_fd(),
+                        conn.stream.as_raw_descriptor(),
                         err
                     )
                 });
@@ -385,14 +387,14 @@ impl VsockThreadBackend {
                 return Ok(());
             }
             let conn = self.conn_map.remove(&key).unwrap();
-            self.listener_map.remove(&conn.stream.as_raw_fd());
-            self.stream_map.remove(&conn.stream.as_raw_fd());
+            self.listener_map.remove(&conn.stream.as_raw_descriptor());
+            self.stream_map.remove(&conn.stream.as_raw_descriptor());
             self.local_port_set.remove(&conn.local_port);
-            VhostUserVsockThread::epoll_unregister(conn.epoll_fd, conn.stream.as_raw_fd())
+            VhostUserVsockThread::epoll_unregister(&conn.registrar, conn.stream.as_raw_descriptor())
                 .unwrap_or_else(|err| {
                     warn!(
                         "Could not remove epoll listener for fd {:?}: {:?}",
-                        conn.stream.as_raw_fd(),
+                        conn.stream.as_raw_descriptor(),
                         err
                     )
                 });
@@ -454,7 +456,7 @@ impl VsockThreadBackend {
                     .and_then(|stream| self.add_new_guest_conn(StreamType::Unix(stream), pkt))
                     .unwrap_or_else(|_| self.enq_rst());
             }
-            #[cfg(feature = "backend_vsock")]
+            #[cfg(all(feature = "backend_vsock", unix))]
             BackendType::Vsock(vsock_info) => {
                 VsockStream::connect_with_cid_port(vsock_info.forward_cid, pkt.dst_port())
                     .and_then(|stream| stream.set_nonblocking(true).map(|_| stream))
@@ -474,18 +476,18 @@ impl VsockThreadBackend {
         let conn = VsockConnection::new_peer_init(
             stream.try_clone().map_err(match stream {
                 StreamType::Unix(_) => Error::UnixConnect,
-                #[cfg(feature = "backend_vsock")]
+                #[cfg(all(feature = "backend_vsock", unix))]
                 StreamType::Vsock(_) => Error::VsockConnect,
             })?,
             pkt.dst_cid(),
             pkt.dst_port(),
             pkt.src_cid(),
             pkt.src_port(),
-            self.epoll_fd,
+            self.registrar.clone(),
             pkt.buf_alloc(),
             self.tx_buffer_size,
         );
-        let stream_fd = conn.stream.as_raw_fd();
+        let stream_fd = conn.stream.as_raw_descriptor();
         self.listener_map
             .insert(stream_fd, ConnMapKey::new(pkt.dst_port(), pkt.src_port()));
 
@@ -498,9 +500,9 @@ impl VsockThreadBackend {
         self.local_port_set.insert(pkt.dst_port());
 
         VhostUserVsockThread::epoll_register(
-            self.epoll_fd,
+            &self.registrar,
             stream_fd,
-            epoll::Events::EPOLLIN | epoll::Events::EPOLLOUT,
+            EventSet::IN | EventSet::OUT,
         )?;
         Ok(())
     }
@@ -514,15 +516,16 @@ impl VsockThreadBackend {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::net::UnixListener;
+    use vmm_sys_util::epoll::Epoll;
+    use crate::platform::UnixListener;
 
     use tempfile::tempdir;
     use virtio_vsock::packet::{VsockPacket, PKT_HEADER_SIZE};
-    #[cfg(feature = "backend_vsock")]
+    #[cfg(all(feature = "backend_vsock", unix))]
     use vsock::{VsockListener, VMADDR_CID_ANY, VMADDR_CID_LOCAL};
 
     use super::*;
-    #[cfg(feature = "backend_vsock")]
+    #[cfg(all(feature = "backend_vsock", unix))]
     use crate::vhu_vsock::VsockProxyInfo;
     use crate::vhu_vsock::{BackendType, VhostUserVsockBackend, VsockConfig, VSOCK_OP_RW};
 
@@ -535,7 +538,7 @@ mod tests {
     fn test_vsock_thread_backend(backend_info: BackendType) {
         const CID: u64 = 3;
 
-        let epoll_fd = epoll::create(false).unwrap();
+        let registrar = Arc::new(Registrar::with_epoll(Arc::new(Epoll::new().unwrap())));
 
         let groups_set: HashSet<String> = vec![GROUP_NAME.to_string()].into_iter().collect();
 
@@ -543,7 +546,7 @@ mod tests {
 
         let mut vtp = VsockThreadBackend::new(
             backend_info,
-            epoll_fd,
+            registrar,
             CID,
             CONN_TX_BUF_SIZE,
             Arc::new(RwLock::new(groups_set)),
@@ -607,7 +610,7 @@ mod tests {
         test_dir.close().unwrap();
     }
 
-    #[cfg(feature = "backend_vsock")]
+    #[cfg(all(feature = "backend_vsock", unix))]
     #[test]
     fn test_vsock_thread_backend_vsock() {
         VsockListener::bind_with_cid_port(VMADDR_CID_LOCAL, libc::VMADDR_PORT_ANY).expect(
@@ -674,7 +677,7 @@ mod tests {
         let sibling2_backend =
             Arc::new(VhostUserVsockBackend::new(sibling2_config, cid_map.clone()).unwrap());
 
-        let epoll_fd = epoll::create(false).unwrap();
+        let registrar = Arc::new(Registrar::with_epoll(Arc::new(Epoll::new().unwrap())));
 
         let groups_set: HashSet<String> = vec!["groupA", "groupB", "group3"]
             .into_iter()
@@ -683,7 +686,7 @@ mod tests {
 
         let mut vtp = VsockThreadBackend::new(
             BackendType::UnixDomainSocket(vsock_socket_path),
-            epoll_fd,
+            registrar,
             CID,
             CONN_TX_BUF_SIZE,
             Arc::new(RwLock::new(groups_set)),

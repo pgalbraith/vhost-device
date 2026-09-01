@@ -22,7 +22,8 @@ use vmm_sys_util::{
     eventfd::EventFd,
 };
 
-use crate::{thread_backend::RawPktsQ, vhu_vsock_thread::*};
+use crate::{
+    registrar::FIRST_HOST_EVENT,thread_backend::RawPktsQ, vhu_vsock_thread::*};
 
 pub(crate) type CidMap =
     HashMap<u64, (Arc<RwLock<RawPktsQ>>, Arc<RwLock<HashSet<String>>>, EventFd)>;
@@ -36,13 +37,11 @@ const TX_QUEUE_EVENT: u16 = 1;
 // New descriptors are pending on the event queue.
 const EVT_QUEUE_EVENT: u16 = 2;
 
-/// Notification coming from the backend.
-/// Event range [0...num_queues] is reserved for queues and exit event.
-/// So NUM_QUEUES + 1 is used.
-pub(crate) const BACKEND_EVENT: u16 = (NUM_QUEUES + 1) as u16;
-
 /// Notification coming from the sibling VM.
-pub(crate) const SIBLING_VM_EVENT: u16 = BACKEND_EVENT + 1;
+///
+/// The backend keeps ids 0 to num_queues for the queues and the exit event,
+/// so the device's own ids start above them.
+pub(crate) const SIBLING_VM_EVENT: u16 = (NUM_QUEUES + 1) as u16;
 
 /// CID of the host
 pub(crate) const VSOCK_HOST_CID: u64 = 2;
@@ -88,8 +87,6 @@ pub(crate) enum Error {
     UnixAccept(std::io::Error),
     #[error("Failed to bind a unix stream")]
     UnixBind(std::io::Error),
-    #[error("Failed to create an epoll fd")]
-    EpollFdCreate(std::io::Error),
     #[error("Failed to add to epoll")]
     EpollAdd(std::io::Error),
     #[error("Failed to modify evset associated with epoll")]
@@ -116,13 +113,13 @@ pub(crate) enum Error {
     PktBufMissing,
     #[error("Failed to connect to unix socket")]
     UnixConnect(std::io::Error),
-    #[cfg(feature = "backend_vsock")]
+    #[cfg(all(feature = "backend_vsock", unix))]
     #[error("Failed to accept new local vsock socket connection")]
     VsockAccept(std::io::Error),
-    #[cfg(feature = "backend_vsock")]
+    #[cfg(all(feature = "backend_vsock", unix))]
     #[error("Failed to connect to vsock socket")]
     VsockConnect(std::io::Error),
-    #[cfg(feature = "backend_vsock")]
+    #[cfg(all(feature = "backend_vsock", unix))]
     #[error("Failed to bind a vsock stream")]
     VsockBind(std::io::Error),
     #[error("Unable to write to stream")]
@@ -149,7 +146,7 @@ impl std::convert::From<Error> for std::io::Error {
     }
 }
 
-#[cfg(feature = "backend_vsock")]
+#[cfg(all(feature = "backend_vsock", unix))]
 #[derive(Debug, PartialEq, Clone)]
 pub(crate) struct VsockProxyInfo {
     pub forward_cid: u32,
@@ -161,7 +158,7 @@ pub(crate) enum BackendType {
     /// unix domain socket path
     UnixDomainSocket(PathBuf),
     /// the vsock CID and ports
-    #[cfg(feature = "backend_vsock")]
+    #[cfg(all(feature = "backend_vsock", unix))]
     Vsock(VsockProxyInfo),
 }
 
@@ -336,7 +333,9 @@ impl VhostUserBackend for VhostUserVsockBackend {
         let vring_rx = &vrings[0];
         let vring_tx = &vrings[1];
 
-        if evset != EventSet::IN {
+        // Host descriptors are watched for writability too, so only the
+        // device's own events have to be readable.
+        if device_event < FIRST_HOST_EVENT && evset != EventSet::IN {
             return Err(Error::HandleEventNotEpollIn.into());
         }
 
@@ -351,21 +350,21 @@ impl VhostUserBackend for VhostUserVsockBackend {
             EVT_QUEUE_EVENT => {
                 warn!("Received an unexpected EVT_QUEUE_EVENT");
             }
-            BACKEND_EVENT => {
-                thread.process_backend_evt(evset);
-                if let Err(e) = thread.process_tx(vring_tx, evt_idx) {
-                    match e {
-                        Error::NoMemoryConfigured => {
-                            warn!("Received a backend event before vring initialization")
-                        }
-                        _ => return Err(e.into()),
-                    }
-                }
-            }
             SIBLING_VM_EVENT => {
                 let _ = thread.sibling_event_fd.read();
                 thread.process_raw_pkts(vring_rx, evt_idx)?;
                 return Ok(());
+            }
+            id if id >= FIRST_HOST_EVENT => {
+                thread.process_host_evt(id, evset);
+                if let Err(e) = thread.process_tx(vring_tx, evt_idx) {
+                    match e {
+                        Error::NoMemoryConfigured => {
+                            warn!("Received a host event before vring initialization")
+                        }
+                        _ => return Err(e.into()),
+                    }
+                }
             }
             _ => {
                 return Err(Error::HandleUnknownEvent.into());
@@ -467,7 +466,10 @@ mod tests {
         let ret = backend.handle_event(EVT_QUEUE_EVENT, EventSet::IN, &vrings, 0);
         ret.unwrap();
 
-        let ret = backend.handle_event(BACKEND_EVENT, EventSet::IN, &vrings, 0);
+        // A host event for a descriptor that is no longer registered. It
+        // is ignored, not refused: a connection can close while an event
+        // for it is still pending.
+        let ret = backend.handle_event(FIRST_HOST_EVENT, EventSet::IN, &vrings, 0);
         ret.unwrap();
     }
 
@@ -499,7 +501,7 @@ mod tests {
         test_dir.close().unwrap();
     }
 
-    #[cfg(feature = "backend_vsock")]
+    #[cfg(all(feature = "backend_vsock", unix))]
     #[test]
     fn test_vsock_backend_vsock() {
         const CID: u64 = 3;
@@ -586,7 +588,7 @@ mod tests {
         );
         assert_eq!(
             backend
-                .handle_event(SIBLING_VM_EVENT + 1, EventSet::IN, &vrings, 0)
+                .handle_event(SIBLING_VM_EVENT - 1, EventSet::IN, &vrings, 0)
                 .unwrap_err()
                 .to_string(),
             Error::HandleUnknownEvent.to_string()
@@ -611,7 +613,7 @@ mod tests {
         );
         assert_eq!(format!("{unix_config:?}"), "VsockConfig { guest_cid: 0, socket: \"\", backend_info: UnixDomainSocket(\"\"), tx_buffer_size: 0, queue_size: 0, groups: [\"\"] }");
 
-        #[cfg(feature = "backend_vsock")]
+        #[cfg(all(feature = "backend_vsock", unix))]
         let vsock_config = VsockConfig::new(
             0,
             PathBuf::new(),
@@ -623,7 +625,7 @@ mod tests {
             0,
             vec![String::new()],
         );
-        #[cfg(feature = "backend_vsock")]
+        #[cfg(all(feature = "backend_vsock", unix))]
         assert_eq!(format!("{vsock_config:?}"), "VsockConfig { guest_cid: 0, socket: \"\", backend_info: Vsock(VsockProxyInfo { forward_cid: 1, listen_ports: [9001, 9002] }), tx_buffer_size: 0, queue_size: 0, groups: [\"\"] }");
 
         let conn_map = ConnMapKey::new(0, 0);
