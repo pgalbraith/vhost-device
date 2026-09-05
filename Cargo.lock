@@ -543,7 +543,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -694,7 +694,7 @@ dependencies = [
  "gobject-sys",
  "libc",
  "system-deps",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1645,7 +1645,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1920,7 +1920,7 @@ dependencies = [
  "getrandom",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2135,7 +2135,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vhost"
 version = "0.17.0"
-source = "git+https://github.com/pgalbraith/vhost.git?rev=cf0be2996d4478f3532ce5afa613f33f727bb0ca#cf0be2996d4478f3532ce5afa613f33f727bb0ca"
+source = "git+https://github.com/pgalbraith/vhost.git?rev=83bd89b402279becab9224c7f9b1b2060fbaa161#83bd89b402279becab9224c7f9b1b2060fbaa161"
 dependencies = [
  "bitflags 2.13.0",
  "libc",
@@ -2462,7 +2462,7 @@ dependencies = [
 [[package]]
 name = "vhost-user-backend"
 version = "0.23.0"
-source = "git+https://github.com/pgalbraith/vhost.git?rev=cf0be2996d4478f3532ce5afa613f33f727bb0ca#cf0be2996d4478f3532ce5afa613f33f727bb0ca"
+source = "git+https://github.com/pgalbraith/vhost.git?rev=83bd89b402279becab9224c7f9b1b2060fbaa161#83bd89b402279becab9224c7f9b1b2060fbaa161"
 dependencies = [
  "libc",
  "log",
