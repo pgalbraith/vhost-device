@@ -39,6 +39,9 @@ use crate::{
     vsock_conn::*,
 };
 
+// Unused on a Windows build with the `completion` feature; see
+// `register_listeners` below.
+#[cfg_attr(all(windows, feature = "completion"), allow(dead_code))]
 type ArcVhostBknd = Arc<VhostUserVsockBackend>;
 
 enum RxQueueType {
@@ -249,6 +252,11 @@ impl VhostUserVsockThread {
 
     /// Give the registrar the backend's event loop, and register the
     /// sibling-VM doorbell with it.
+    ///
+    /// Unused on a Windows build with the `completion` feature: `main.rs`
+    /// calls this only on the epoll path, and the completion path's
+    /// `attach` (ADR-0001 action item 5) replaces it.
+    #[cfg_attr(all(windows, feature = "completion"), allow(dead_code))]
     pub fn register_listeners(&mut self, epoll_handler: Arc<VringEpollHandler<ArcVhostBknd>>) {
         epoll_handler
             .register_listener(

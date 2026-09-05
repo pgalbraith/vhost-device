@@ -13,6 +13,10 @@ edition = "2021"
 default = ["backend_vsock"]
 backend_vsock = ["vsock", "libc"]
 xen = ["vm-memory/xen", "vhost/xen", "vhost-user-backend/xen"]
+# Run the vring workers on vhost-user-backend's completion-port loop instead of its epoll loop
+# (ADR-0001, action item 5). Windows only; inert elsewhere. Not yet in `default` -- the host-socket
+# side of this feature is still being built out.
+completion = ["vhost-user-backend/completion", "vmm-sys-util/completion"]
 
 [dependencies]
 byteorder = "1"

@@ -330,34 +330,28 @@ impl VhostUserBackend for VhostUserVsockBackend {
         vrings: &[VringRwLock],
         thread_id: usize,
     ) -> IoResult<()> {
-        let vring_rx = &vrings[0];
-        let vring_tx = &vrings[1];
-
         // Host descriptors are watched for writability too, so only the
         // device's own events have to be readable.
         if device_event < FIRST_HOST_EVENT && evset != EventSet::IN {
             return Err(Error::HandleEventNotEpollIn.into());
         }
 
-        let mut thread = self.threads[thread_id].lock().unwrap();
-        let evt_idx = thread.event_idx;
-
         match device_event {
-            RX_QUEUE_EVENT => {}
-            TX_QUEUE_EVENT => {
-                thread.process_tx(vring_tx, evt_idx)?;
-            }
-            EVT_QUEUE_EVENT => {
-                warn!("Received an unexpected EVT_QUEUE_EVENT");
+            RX_QUEUE_EVENT | TX_QUEUE_EVENT | EVT_QUEUE_EVENT => {
+                self.process_kicked_queue(device_event, vrings, thread_id)
             }
             SIBLING_VM_EVENT => {
+                let mut thread = self.threads[thread_id].lock().unwrap();
+                let evt_idx = thread.event_idx;
                 let _ = thread.sibling_event_fd.read();
-                thread.process_raw_pkts(vring_rx, evt_idx)?;
-                return Ok(());
+                thread.process_raw_pkts(&vrings[0], evt_idx)?;
+                Ok(())
             }
             id if id >= FIRST_HOST_EVENT => {
+                let mut thread = self.threads[thread_id].lock().unwrap();
+                let evt_idx = thread.event_idx;
                 thread.process_host_evt(id, evset);
-                if let Err(e) = thread.process_tx(vring_tx, evt_idx) {
+                if let Err(e) = thread.process_tx(&vrings[1], evt_idx) {
                     match e {
                         Error::NoMemoryConfigured => {
                             warn!("Received a host event before vring initialization")
@@ -365,17 +359,11 @@ impl VhostUserBackend for VhostUserVsockBackend {
                         _ => return Err(e.into()),
                     }
                 }
+                thread.process_rx(&vrings[0], evt_idx)?;
+                Ok(())
             }
-            _ => {
-                return Err(Error::HandleUnknownEvent.into());
-            }
+            _ => Err(Error::HandleUnknownEvent.into()),
         }
-
-        if device_event != EVT_QUEUE_EVENT {
-            thread.process_rx(vring_rx, evt_idx)?;
-        }
-
-        Ok(())
     }
 
     fn get_config(&self, offset: u32, size: u32) -> Vec<u8> {
@@ -399,6 +387,134 @@ impl VhostUserBackend for VhostUserVsockBackend {
         let consumer = self.exit_consumer.try_clone().ok()?;
         let notifier = self.exit_notifier.try_clone().ok()?;
         Some((consumer, notifier))
+    }
+}
+
+impl VhostUserVsockBackend {
+    /// Process the vring `handle_event` was told is kicked: the same
+    /// dispatch for `RX_QUEUE_EVENT`/`TX_QUEUE_EVENT`/`EVT_QUEUE_EVENT` on
+    /// both loops. `handle_event` calls this after its event-set check; the
+    /// completion loop's `handle_kick` (below) calls it directly, since a
+    /// kick there carries no event set to check.
+    fn process_kicked_queue(
+        &self,
+        vring: u16,
+        vrings: &[VringRwLock],
+        thread_id: usize,
+    ) -> IoResult<()> {
+        let vring_rx = &vrings[0];
+        let vring_tx = &vrings[1];
+
+        let mut thread = self.threads[thread_id].lock().unwrap();
+        let evt_idx = thread.event_idx;
+
+        match vring {
+            RX_QUEUE_EVENT => {}
+            TX_QUEUE_EVENT => {
+                thread.process_tx(vring_tx, evt_idx)?;
+            }
+            EVT_QUEUE_EVENT => {
+                warn!("Received an unexpected EVT_QUEUE_EVENT");
+            }
+            _ => {
+                return Err(Error::HandleUnknownEvent.into());
+            }
+        }
+
+        if vring != EVT_QUEUE_EVENT {
+            thread.process_rx(vring_rx, evt_idx)?;
+        }
+
+        Ok(())
+    }
+}
+
+/// The same device on the completion-port loop (ADR-0001, action item 5).
+///
+/// A kick means the same thing on either loop, so every protocol method
+/// here forwards to the `VhostUserBackend` implementation above; the two
+/// traits are siblings that spell their protocol methods identically. The
+/// differences are confined to the loop-facing methods: `handle_kick` has
+/// no event set to check, and there is no exit event, because the loop
+/// stops on a key it posts to itself.
+///
+/// `attach` and `handle_completion` are stubs for now (action item 5's
+/// infra stage): the host-socket rewrite that gives them real bodies lands
+/// in later stages. Until then this impl exists so the crate compiles
+/// under `--features completion` on Windows, not so the daemon can
+/// actually run on this loop.
+// `VhostUserCompletionBackend` is named by full path rather than `use`d at
+// module scope: it spells its protocol methods the same as
+// `VhostUserBackend`, and importing both into one scope makes every call
+// through `backend.method(...)` (as the existing epoll-path tests below
+// do) ambiguous.
+#[cfg(all(windows, feature = "completion"))]
+impl vhost_user_backend::VhostUserCompletionBackend for VhostUserVsockBackend {
+    type Bitmap = ();
+    type Vring = VringRwLock;
+
+    fn num_queues(&self) -> usize {
+        VhostUserBackend::num_queues(self)
+    }
+
+    fn max_queue_size(&self) -> usize {
+        VhostUserBackend::max_queue_size(self)
+    }
+
+    fn features(&self) -> u64 {
+        VhostUserBackend::features(self)
+    }
+
+    fn protocol_features(&self) -> VhostUserProtocolFeatures {
+        VhostUserBackend::protocol_features(self)
+    }
+
+    fn set_event_idx(&self, enabled: bool) {
+        VhostUserBackend::set_event_idx(self, enabled)
+    }
+
+    fn update_memory(&self, mem: GuestMemoryAtomic<GuestMemoryMmap>) -> IoResult<()> {
+        VhostUserBackend::update_memory(self, mem)
+    }
+
+    fn get_config(&self, offset: u32, size: u32) -> Vec<u8> {
+        VhostUserBackend::get_config(self, offset, size)
+    }
+
+    fn queues_per_thread(&self) -> Vec<u64> {
+        VhostUserBackend::queues_per_thread(self)
+    }
+
+    fn attach(&self, _thread_index: usize, _port: Arc<vmm_sys_util::completion::Port>) -> IoResult<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "vhost-device-vsock does not yet implement the completion loop's host-socket path \
+             (ADR-0001 action item 5 is still in progress)",
+        ))
+    }
+
+    fn handle_kick(
+        &self,
+        vring: u16,
+        vrings: &[VringRwLock],
+        thread_id: usize,
+    ) -> IoResult<()> {
+        self.process_kicked_queue(vring, vrings, thread_id)
+    }
+
+    fn handle_completion(
+        &self,
+        completion: vmm_sys_util::completion::Completion,
+        _vrings: &[VringRwLock],
+        _thread_id: usize,
+    ) -> IoResult<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "vhost-device-vsock does not yet implement the completion loop's host-socket \
+                 path (ADR-0001 action item 5 is still in progress): {completion:?}"
+            ),
+        ))
     }
 }
 

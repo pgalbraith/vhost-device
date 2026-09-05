@@ -61,6 +61,12 @@ enum Backing {
     /// Weak, or nothing is ever freed: the handler owns the backend, the
     /// backend owns the thread, and the thread owns this. The daemon holds
     /// the handler, so a weak reference is enough to keep working.
+    ///
+    /// Unused for now on a Windows build with the `completion` feature:
+    /// `main.rs` only calls `attach`/`register_listeners` on the epoll
+    /// path. It goes away entirely once ADR-0001 action item 5 removes
+    /// `Registrar` from Windows.
+    #[cfg_attr(all(windows, feature = "completion"), allow(dead_code))]
     Handler(Weak<VringEpollHandler<ArcVhostBknd>>),
 }
 
@@ -152,6 +158,10 @@ impl Registrar {
 
     /// Start using the backend's event loop, registering everything that was
     /// recorded before it arrived.
+    ///
+    /// Unused on a Windows build with the `completion` feature; see
+    /// [`Backing::Handler`].
+    #[cfg_attr(all(windows, feature = "completion"), allow(dead_code))]
     pub fn attach(&self, handler: Weak<VringEpollHandler<ArcVhostBknd>>) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         inner.backing = Backing::Handler(handler);
