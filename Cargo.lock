@@ -2545,7 +2545,7 @@ dependencies = [
 [[package]]
 name = "vm-memory"
 version = "0.18.0"
-source = "git+https://github.com/pgalbraith/rust-vmm.git?rev=a7083cb3a8ff5fe1b0b91e2134c373ec549a5d51#a7083cb3a8ff5fe1b0b91e2134c373ec549a5d51"
+source = "git+https://github.com/pgalbraith/rust-vmm.git?rev=664ef7d866fa8e7e09511eb76a2ec1d501394fda#664ef7d866fa8e7e09511eb76a2ec1d501394fda"
 dependencies = [
  "arc-swap",
  "bitflags 2.13.0",
@@ -2558,7 +2558,7 @@ dependencies = [
 [[package]]
 name = "vmm-sys-util"
 version = "0.15.0"
-source = "git+https://github.com/pgalbraith/rust-vmm.git?rev=a7083cb3a8ff5fe1b0b91e2134c373ec549a5d51#a7083cb3a8ff5fe1b0b91e2134c373ec549a5d51"
+source = "git+https://github.com/pgalbraith/rust-vmm.git?rev=664ef7d866fa8e7e09511eb76a2ec1d501394fda#664ef7d866fa8e7e09511eb76a2ec1d501394fda"
 dependencies = [
  "bitflags 2.13.0",
  "libc",

@@ -72,5 +72,5 @@ cloned_ref_to_slice_refs = "allow"
 # patch them to the same rev so one copy resolves everywhere. Two copies
 # compile, then fail to unify generic types like GuestMemoryMmap between them.
 [patch.crates-io]
-vm-memory = { git = "https://github.com/pgalbraith/rust-vmm.git", rev = "a7083cb3a8ff5fe1b0b91e2134c373ec549a5d51" }
-vmm-sys-util = { git = "https://github.com/pgalbraith/rust-vmm.git", rev = "a7083cb3a8ff5fe1b0b91e2134c373ec549a5d51" }
+vm-memory = { git = "https://github.com/pgalbraith/rust-vmm.git", rev = "664ef7d866fa8e7e09511eb76a2ec1d501394fda" }
+vmm-sys-util = { git = "https://github.com/pgalbraith/rust-vmm.git", rev = "664ef7d866fa8e7e09511eb76a2ec1d501394fda" }
