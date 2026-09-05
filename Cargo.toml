@@ -25,8 +25,8 @@ members = [
 # rev, naming the same revs virtiofsd does, so a crate compiled here and one
 # compiled there are the same crate. See ~/.cargo/config.toml for why the pin
 # belongs in each consuming workspace rather than machine-wide.
-vhost = { git = "https://github.com/pgalbraith/vhost.git", rev = "83bd89b402279becab9224c7f9b1b2060fbaa161", features = ["vhost-user-backend"] }
-vhost-user-backend = { git = "https://github.com/pgalbraith/vhost.git", rev = "83bd89b402279becab9224c7f9b1b2060fbaa161" }
+vhost = { git = "https://github.com/pgalbraith/vhost.git", rev = "eff66eaa0e943e6f69e86829989985f7409707fd", features = ["vhost-user-backend"] }
+vhost-user-backend = { git = "https://github.com/pgalbraith/vhost.git", rev = "eff66eaa0e943e6f69e86829989985f7409707fd" }
 virtio-bindings = "0.2.5"
 virtio-queue = "0.18"
 vm-memory = "0.18.0"

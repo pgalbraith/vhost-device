@@ -2135,7 +2135,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vhost"
 version = "0.17.0"
-source = "git+https://github.com/pgalbraith/vhost.git?rev=83bd89b402279becab9224c7f9b1b2060fbaa161#83bd89b402279becab9224c7f9b1b2060fbaa161"
+source = "git+https://github.com/pgalbraith/vhost.git?rev=eff66eaa0e943e6f69e86829989985f7409707fd#eff66eaa0e943e6f69e86829989985f7409707fd"
 dependencies = [
  "bitflags 2.13.0",
  "libc",
@@ -2462,7 +2462,7 @@ dependencies = [
 [[package]]
 name = "vhost-user-backend"
 version = "0.23.0"
-source = "git+https://github.com/pgalbraith/vhost.git?rev=83bd89b402279becab9224c7f9b1b2060fbaa161#83bd89b402279becab9224c7f9b1b2060fbaa161"
+source = "git+https://github.com/pgalbraith/vhost.git?rev=eff66eaa0e943e6f69e86829989985f7409707fd#eff66eaa0e943e6f69e86829989985f7409707fd"
 dependencies = [
  "libc",
  "log",
