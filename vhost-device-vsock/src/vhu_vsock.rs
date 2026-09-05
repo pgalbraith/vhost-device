@@ -492,11 +492,12 @@ impl vhost_user_backend::VhostUserCompletionBackend for VhostUserVsockBackend {
     fn attach(&self, thread_index: usize, port: Arc<vmm_sys_util::completion::Port>) -> IoResult<()> {
         use std::os::windows::io::AsHandle;
 
-        let thread = self.threads[thread_index].lock().unwrap();
+        let mut thread = self.threads[thread_index].lock().unwrap();
         port.register(
             thread.sibling_event_fd.as_handle(),
             SIBLING_VM_EVENT as usize,
-        )
+        )?;
+        thread.attach_accept_loop(port)
     }
 
     fn handle_kick(
@@ -532,6 +533,15 @@ impl vhost_user_backend::VhostUserCompletionBackend for VhostUserVsockBackend {
                 let evt_idx = thread.event_idx;
                 thread.process_raw_pkts(&vrings[0], evt_idx)?;
                 Ok(())
+            }
+            vmm_sys_util::completion::Completion::Operation {
+                key,
+                result,
+                operation,
+            } if key == crate::vhu_vsock_thread::LISTENER_ACCEPT_KEY => {
+                result?;
+                let mut thread = self.threads[thread_id].lock().unwrap();
+                thread.finish_accept(operation)
             }
             other => Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -875,9 +885,9 @@ mod tests {
         )
         .unwrap();
 
-        // This device submits no operations yet, so anything else reaching
-        // `handle_completion` is unaccounted for and must be refused, not
-        // silently accepted.
+        // Anything this device doesn't recognise -- not the sibling
+        // doorbell, not one of its own accept operations -- is
+        // unaccounted for and must be refused, not silently accepted.
         let unexpected = Completion::Posted {
             key: 999,
             bytes: 0,
@@ -887,6 +897,69 @@ mod tests {
             &backend, unexpected, &vrings, 0,
         )
         .is_err());
+
+        let _ = std::fs::remove_file(vhost_socket_path);
+        let _ = std::fs::remove_file(vsock_socket_path);
+        test_dir.close().unwrap();
+    }
+
+    /// ADR-0001 action item 5, stage 3: `attach` submits the host
+    /// listener's first accept, and each accept completion resubmits the
+    /// next one. Two connects in a row prove the loop keeps running, not
+    /// just its first iteration.
+    #[cfg(all(windows, feature = "completion"))]
+    #[test]
+    fn completion_accept_loop_resubmits_after_each_connection() {
+        use std::time::Duration;
+
+        use uds_windows::UnixStream;
+        use vmm_sys_util::completion::Port;
+
+        const CID: u64 = 3;
+        let groups_list: Vec<String> = vec![String::from("default")];
+        let test_dir = tempdir().expect("Could not create a temp test directory.");
+        let vhost_socket_path = test_dir.path().join("test_completion_accept.socket");
+        let vsock_socket_path = test_dir.path().join("test_completion_accept.vsock");
+        let cid_map: Arc<RwLock<CidMap>> = Arc::new(RwLock::new(HashMap::new()));
+
+        let config = VsockConfig::new(
+            CID,
+            vhost_socket_path.clone(),
+            BackendType::UnixDomainSocket(vsock_socket_path.clone()),
+            CONN_TX_BUF_SIZE,
+            QUEUE_SIZE,
+            groups_list,
+        );
+        let backend = VhostUserVsockBackend::new(config, cid_map).unwrap();
+
+        let port = Arc::new(Port::new().unwrap());
+        vhost_user_backend::VhostUserCompletionBackend::attach(&backend, 0, port.clone())
+            .expect("attach should submit the listener's first accept");
+
+        for expected_count in 1..=2 {
+            let _client = UnixStream::connect(&vsock_socket_path)
+                .expect("the listener should be accepting connections");
+
+            let mut completions = Vec::new();
+            port.wait(Some(Duration::from_secs(5)), &mut completions)
+                .unwrap();
+            assert_eq!(completions.len(), 1);
+            let completion = completions.pop().unwrap();
+
+            vhost_user_backend::VhostUserCompletionBackend::handle_completion(
+                &backend,
+                completion,
+                &[],
+                0,
+            )
+            .expect("finish_accept should succeed and resubmit the next accept");
+
+            assert_eq!(
+                backend.threads[0].lock().unwrap().accepted_sockets.len(),
+                expected_count,
+                "each connection should add exactly one tracked socket"
+            );
+        }
 
         let _ = std::fs::remove_file(vhost_socket_path);
         let _ = std::fs::remove_file(vsock_socket_path);

@@ -44,6 +44,12 @@ use crate::{
 #[cfg_attr(all(windows, feature = "completion"), allow(dead_code))]
 type ArcVhostBknd = Arc<VhostUserVsockBackend>;
 
+/// Key the host listener's `AcceptEx` operations are associated under
+/// (ADR-0001 action item 5). Above `num_queues()`, like every key this
+/// device owns, and distinct from `SIBLING_VM_EVENT`.
+#[cfg(all(windows, feature = "completion"))]
+pub(crate) const LISTENER_ACCEPT_KEY: usize = (SIBLING_VM_EVENT + 1) as usize;
+
 enum RxQueueType {
     Standard,
     RawPkts,
@@ -95,6 +101,21 @@ pub(crate) struct VhostUserVsockThread {
     /// Used to alternate between the RX queues to prevent the starvation of one
     /// by the other.
     last_processed: RxQueueType,
+    /// The worker's completion port, once `attach` has run (ADR-0001
+    /// action item 5). `handle_completion` needs it to resubmit an accept
+    /// but is not itself given the port, so `attach` stashes it here.
+    #[cfg(all(windows, feature = "completion"))]
+    port: Option<Arc<vmm_sys_util::completion::Port>>,
+    /// Sockets `AcceptEx` has completed, stashed here rather than tracked
+    /// as real connections.
+    ///
+    /// This is stage 3 of ADR-0001 action item 5: it proves the accept
+    /// loop itself (submit, complete, extract, resubmit) works. Stage 4
+    /// replaces it with real connection tracking through
+    /// `VsockThreadBackend::conn_map`, once the Windows connection type
+    /// that needs exists.
+    #[cfg(all(windows, feature = "completion"))]
+    pub(crate) accepted_sockets: Vec<std::os::windows::io::OwnedSocket>,
 }
 
 impl VhostUserVsockThread {
@@ -186,6 +207,10 @@ impl VhostUserVsockThread {
             tx_buffer_size,
             sibling_event_fd,
             last_processed: RxQueueType::Standard,
+            #[cfg(all(windows, feature = "completion"))]
+            port: None,
+            #[cfg(all(windows, feature = "completion"))]
+            accepted_sockets: Vec::new(),
         };
 
         for host_raw_fd in thread.host_listeners_map.keys() {
@@ -268,6 +293,98 @@ impl VhostUserVsockThread {
         self.registrar
             .attach(Arc::downgrade(&epoll_handler))
             .unwrap();
+    }
+
+    /// Associate the host listener with `port` and submit its first
+    /// accept (ADR-0001 action item 5, stage 3). Called once from
+    /// `VhostUserCompletionBackend::attach`.
+    #[cfg(all(windows, feature = "completion"))]
+    pub(crate) fn attach_accept_loop(
+        &mut self,
+        port: Arc<vmm_sys_util::completion::Port>,
+    ) -> std::io::Result<()> {
+        let listener = self.unix_listener_socket()?;
+        vmm_sys_util::completion::socket::associate(&port, listener, LISTENER_ACCEPT_KEY)?;
+        Self::submit_accept(&port, listener)?;
+        self.port = Some(port);
+        Ok(())
+    }
+
+    /// Finish an accept `handle_completion` reported: extract the
+    /// connected socket, resubmit the listener's next accept, and stash
+    /// the socket in `accepted_sockets`.
+    #[cfg(all(windows, feature = "completion"))]
+    pub(crate) fn finish_accept(
+        &mut self,
+        mut operation: vmm_sys_util::completion::Operation,
+    ) -> std::io::Result<()> {
+        let listener = self.unix_listener_socket()?;
+        let accepted = vmm_sys_util::completion::socket::finish_accept(listener, &mut operation)?;
+        let port = self
+            .port
+            .clone()
+            .expect("finish_accept called before attach_accept_loop");
+        Self::submit_accept(&port, listener)?;
+        self.accepted_sockets.push(accepted);
+        Ok(())
+    }
+
+    /// The host UDS listener as a socket, for associating with the port
+    /// and for `AcceptEx`/`finish_accept`. `backend_vsock`'s AF_VSOCK
+    /// listener is Unix-only (see `ListenerType`), so this crate's only
+    /// Windows listener is the UDS one.
+    #[cfg(all(windows, feature = "completion"))]
+    fn unix_listener_socket(&self) -> std::io::Result<std::os::windows::io::BorrowedSocket<'_>> {
+        use std::os::windows::io::AsRawSocket;
+
+        let Some(listener) = self.host_listeners_map.values().next() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no host UDS listener to accept on",
+            ));
+        };
+        // `ListenerType::Vsock` is Unix-only (AF_VSOCK forwarding), so this
+        // is the only variant a Windows build can construct.
+        let ListenerType::Unix(listener) = listener;
+        // SAFETY: `listener` outlives the borrow this returns, which does
+        // not outlive `self`.
+        Ok(unsafe { std::os::windows::io::BorrowedSocket::borrow_raw(listener.as_raw_socket()) })
+    }
+
+    /// Submit one accept on `listener`: a fresh, unbound `AF_UNIX` socket
+    /// for `AcceptEx` to fill in. `uds_windows` has no public constructor
+    /// for an unbound socket, so this creates one the same way
+    /// `vmm-sys-util`'s own verified test does
+    /// (`socket(AF_UNIX, SOCK_STREAM, 0)`).
+    #[cfg(all(windows, feature = "completion"))]
+    fn submit_accept(
+        port: &vmm_sys_util::completion::Port,
+        listener: std::os::windows::io::BorrowedSocket<'_>,
+    ) -> std::io::Result<()> {
+        use std::os::windows::io::{FromRawSocket, RawSocket};
+        use windows_sys::Win32::Networking::WinSock::{
+            socket, AF_UNIX, INVALID_SOCKET, SOCK_STREAM,
+        };
+
+        // SAFETY: a plain socket() call; the result is checked before use.
+        let raw = unsafe { socket(i32::from(AF_UNIX), SOCK_STREAM, 0) };
+        if raw == INVALID_SOCKET {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `raw` was just created above and is owned by nothing
+        // else.
+        let accepted = unsafe { std::os::windows::io::OwnedSocket::from_raw_socket(raw as RawSocket) };
+
+        vmm_sys_util::completion::socket::accept(
+            port,
+            listener,
+            accepted,
+            vmm_sys_util::completion::Operation::new(vec![
+                0u8;
+                vmm_sys_util::completion::socket::ACCEPT_BUFFER_LEN
+            ]),
+        )?;
+        Ok(())
     }
 
     /// Handle an event the backend's loop reported for a host descriptor.
