@@ -485,12 +485,18 @@ impl vhost_user_backend::VhostUserCompletionBackend for VhostUserVsockBackend {
         VhostUserBackend::queues_per_thread(self)
     }
 
-    fn attach(&self, _thread_index: usize, _port: Arc<vmm_sys_util::completion::Port>) -> IoResult<()> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "vhost-device-vsock does not yet implement the completion loop's host-socket path \
-             (ADR-0001 action item 5 is still in progress)",
-        ))
+    /// Register the sibling-VM doorbell as a `Signal` on the worker's port
+    /// (ADR-0001 action item 5, stage 2). The host-socket side (accepts,
+    /// receives, sends) still has no completion-loop implementation; that
+    /// is the rest of action item 5.
+    fn attach(&self, thread_index: usize, port: Arc<vmm_sys_util::completion::Port>) -> IoResult<()> {
+        use std::os::windows::io::AsHandle;
+
+        let thread = self.threads[thread_index].lock().unwrap();
+        port.register(
+            thread.sibling_event_fd.as_handle(),
+            SIBLING_VM_EVENT as usize,
+        )
     }
 
     fn handle_kick(
@@ -502,19 +508,39 @@ impl vhost_user_backend::VhostUserCompletionBackend for VhostUserVsockBackend {
         self.process_kicked_queue(vring, vrings, thread_id)
     }
 
+    /// The sibling-VM doorbell arrives here as a `Signal`, not through
+    /// `handle_kick`: unlike a vring's kick, its key (`SIBLING_VM_EVENT`,
+    /// above `num_queues()`) is the device's own, so the loop reports it as
+    /// `Completion::Signal` rather than dispatching it as a queue. The
+    /// kernel has already consumed the event by the time this is called
+    /// (the wait that noticed it is what reset it), so there is nothing to
+    /// read, unlike the epoll path's `sibling_event_fd.read()`.
+    ///
+    /// Anything else reaching here is host-socket I/O this device does not
+    /// submit yet -- the rest of action item 5.
     fn handle_completion(
         &self,
         completion: vmm_sys_util::completion::Completion,
-        _vrings: &[VringRwLock],
-        _thread_id: usize,
+        vrings: &[VringRwLock],
+        thread_id: usize,
     ) -> IoResult<()> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            format!(
-                "vhost-device-vsock does not yet implement the completion loop's host-socket \
-                 path (ADR-0001 action item 5 is still in progress): {completion:?}"
-            ),
-        ))
+        match completion {
+            vmm_sys_util::completion::Completion::Signal { key }
+                if key == SIBLING_VM_EVENT as usize =>
+            {
+                let mut thread = self.threads[thread_id].lock().unwrap();
+                let evt_idx = thread.event_idx;
+                thread.process_raw_pkts(&vrings[0], evt_idx)?;
+                Ok(())
+            }
+            other => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!(
+                    "vhost-device-vsock does not yet implement the completion loop's \
+                     host-socket path (ADR-0001 action item 5 is still in progress): {other:?}"
+                ),
+            )),
+        }
     }
 }
 
@@ -760,5 +786,110 @@ mod tests {
 
         let error = Error::HandleEventNotEpollIn;
         assert_eq!(format!("{error:?}"), "HandleEventNotEpollIn");
+    }
+
+    /// ADR-0001 action item 5, stage 2: `attach` registers the sibling-VM
+    /// doorbell as a `Signal`, and `handle_completion` reports it back and
+    /// dispatches it to `process_raw_pkts` the same way the epoll path's
+    /// `SIBLING_VM_EVENT` arm does -- without a host-socket rewrite
+    /// anywhere in this test.
+    #[cfg(all(windows, feature = "completion"))]
+    #[test]
+    fn completion_signal_for_sibling_doorbell_dispatches_to_process_raw_pkts() {
+        use std::time::Duration;
+
+        use virtio_vsock::packet::PKT_HEADER_SIZE;
+        use vmm_sys_util::completion::{Completion, Port};
+
+        use crate::thread_backend::RawVsockPacket;
+
+        const CID: u64 = 3;
+        let groups_list: Vec<String> = vec![String::from("default")];
+        let test_dir = tempdir().expect("Could not create a temp test directory.");
+        let vhost_socket_path = test_dir.path().join("test_completion_signal.socket");
+        let vsock_socket_path = test_dir.path().join("test_completion_signal.vsock");
+        let cid_map: Arc<RwLock<CidMap>> = Arc::new(RwLock::new(HashMap::new()));
+
+        let config = VsockConfig::new(
+            CID,
+            vhost_socket_path.clone(),
+            BackendType::UnixDomainSocket(vsock_socket_path.clone()),
+            CONN_TX_BUF_SIZE,
+            QUEUE_SIZE,
+            groups_list,
+        );
+        let backend = VhostUserVsockBackend::new(config, cid_map).unwrap();
+
+        let mem = GuestMemoryAtomic::new(
+            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
+        );
+        let vrings = [
+            VringRwLock::new(mem.clone(), 0x1000).unwrap(),
+            VringRwLock::new(mem.clone(), 0x2000).unwrap(),
+        ];
+        vrings[0].set_queue_info(0x100, 0x200, 0x300).unwrap();
+        vrings[0].set_queue_ready(true);
+        vrings[1].set_queue_info(0x1100, 0x1200, 0x1300).unwrap();
+        vrings[1].set_queue_ready(true);
+        backend.update_memory(mem).unwrap();
+
+        let port = Arc::new(Port::new().unwrap());
+        vhost_user_backend::VhostUserCompletionBackend::attach(&backend, 0, port.clone())
+            .expect("attach should register the sibling doorbell");
+
+        // Simulate a sibling VM's `send_pkt` delivering a raw packet: the
+        // same two steps it takes (`thread_backend.rs`'s sibling-forwarding
+        // branch) without a second backend to send it from.
+        {
+            let thread = backend.threads[0].lock().unwrap();
+            thread
+                .thread_backend
+                .raw_pkts_queue
+                .write()
+                .unwrap()
+                .push_back(RawVsockPacket {
+                    header: [0u8; PKT_HEADER_SIZE],
+                    data: Vec::new(),
+                });
+            thread.sibling_event_fd.write(1).unwrap();
+        }
+
+        let mut completions = Vec::new();
+        port.wait(Some(Duration::from_secs(5)), &mut completions)
+            .unwrap();
+        assert_eq!(completions.len(), 1);
+        let completion = completions.pop().unwrap();
+        assert!(
+            matches!(completion, Completion::Signal { key } if key == SIBLING_VM_EVENT as usize),
+            "expected the sibling doorbell's key, got {completion:?}"
+        );
+
+        // Delivering it exercises exactly what the epoll path's
+        // `SIBLING_VM_EVENT` arm does (`process_raw_pkts` against the rx
+        // vring); the vring here has no descriptors available, so this
+        // checks the wiring succeeds without erroring, the same way
+        // `thread_backend.rs`'s and `vsock_conn.rs`'s own tests check
+        // `process_rx`/`process_raw_pkts` without asserting delivery.
+        vhost_user_backend::VhostUserCompletionBackend::handle_completion(
+            &backend, completion, &vrings, 0,
+        )
+        .unwrap();
+
+        // This device submits no operations yet, so anything else reaching
+        // `handle_completion` is unaccounted for and must be refused, not
+        // silently accepted.
+        let unexpected = Completion::Posted {
+            key: 999,
+            bytes: 0,
+            pointer: 0,
+        };
+        assert!(vhost_user_backend::VhostUserCompletionBackend::handle_completion(
+            &backend, unexpected, &vrings, 0,
+        )
+        .is_err());
+
+        let _ = std::fs::remove_file(vhost_socket_path);
+        let _ = std::fs::remove_file(vsock_socket_path);
+        test_dir.close().unwrap();
     }
 }
