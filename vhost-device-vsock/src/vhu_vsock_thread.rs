@@ -6,7 +6,6 @@ use std::{
     iter::FromIterator,
     num::Wrapping,
     ops::Deref,
-
     sync::{
         mpsc::{self, Sender},
         Arc, RwLock,
@@ -33,8 +32,8 @@ use crate::{
     rxops::*,
     thread_backend::*,
     vhu_vsock::{
-        BackendType, CidMap, ConnMapKey, Error, Result, VhostUserVsockBackend,
-        SIBLING_VM_EVENT, VSOCK_HOST_CID,
+        BackendType, CidMap, ConnMapKey, Error, Result, VhostUserVsockBackend, SIBLING_VM_EVENT,
+        VSOCK_HOST_CID,
     },
     vsock_conn::*,
 };
@@ -49,6 +48,52 @@ type ArcVhostBknd = Arc<VhostUserVsockBackend>;
 /// device owns, and distinct from `SIBLING_VM_EVENT`.
 #[cfg(all(windows, feature = "completion"))]
 pub(crate) const LISTENER_ACCEPT_KEY: usize = (SIBLING_VM_EVENT + 1) as usize;
+
+/// Key every established host connection's receives and sends are
+/// associated under. One key for all of them, rather than one per
+/// connection: `handle_completion` tells them apart by what the
+/// `Operation` holds (see [`HostIo`]), the way [`Operation::hold`]'s own
+/// docs describe.
+#[cfg(all(windows, feature = "completion"))]
+pub(crate) const HOST_IO_KEY: usize = LISTENER_ACCEPT_KEY + 1;
+
+/// What an `Operation` under [`HOST_IO_KEY`] is for, carried in its held
+/// slot so `handle_completion` can route the result without a separate
+/// id-to-connection table.
+///
+/// Unlike an accept operation, a receive or send never claims the held
+/// slot for anything of its own, which is what makes this possible here
+/// (see `socket::accept`'s own use of it for the in-progress socket).
+#[cfg(all(windows, feature = "completion"))]
+pub(crate) enum HostIo {
+    /// Reading the `"CONNECT <port>\n"` line from a freshly accepted
+    /// socket, before it is a tracked connection. The key is the socket's
+    /// own raw value, used to find it in `pending_handshakes`.
+    Handshake(std::os::windows::io::RawSocket),
+    /// A receive for an established connection.
+    Connection(ConnMapKey),
+}
+
+/// A host connection accepted but still being read for its
+/// `"CONNECT <port>\n"` line -- see `VhostUserVsockThread::continue_handshake`.
+#[cfg(all(windows, feature = "completion"))]
+struct PendingHandshake {
+    socket: std::os::windows::io::OwnedSocket,
+    /// Bytes read so far, across possibly more than one receive.
+    buf: Vec<u8>,
+}
+
+/// Parse a `"CONNECT <port>\n"` line (without its trailing newline).
+/// `None` means malformed, not "not yet enough data" -- the caller only
+/// calls this once a newline has been found.
+#[cfg(all(windows, feature = "completion"))]
+fn parse_connect_line(line: &[u8]) -> Option<u32> {
+    let mut words = std::str::from_utf8(line).ok()?.split_whitespace();
+    if words.next()?.to_lowercase() != "connect" {
+        return None;
+    }
+    words.next()?.parse::<u32>().ok()
+}
 
 enum RxQueueType {
     Standard,
@@ -103,19 +148,16 @@ pub(crate) struct VhostUserVsockThread {
     last_processed: RxQueueType,
     /// The worker's completion port, once `attach` has run (ADR-0001
     /// action item 5). `handle_completion` needs it to resubmit an accept
-    /// but is not itself given the port, so `attach` stashes it here.
+    /// or a receive but is not itself given the port, so `attach` stashes
+    /// it here.
     #[cfg(all(windows, feature = "completion"))]
     port: Option<Arc<vmm_sys_util::completion::Port>>,
-    /// Sockets `AcceptEx` has completed, stashed here rather than tracked
-    /// as real connections.
-    ///
-    /// This is stage 3 of ADR-0001 action item 5: it proves the accept
-    /// loop itself (submit, complete, extract, resubmit) works. Stage 4
-    /// replaces it with real connection tracking through
-    /// `VsockThreadBackend::conn_map`, once the Windows connection type
-    /// that needs exists.
+    /// Host connections accepted but still being read for their
+    /// `"CONNECT <port>\n"` line, keyed by the accepted socket's raw
+    /// value. See [`PendingHandshake`] and
+    /// `VhostUserVsockThread::continue_handshake`.
     #[cfg(all(windows, feature = "completion"))]
-    pub(crate) accepted_sockets: Vec<std::os::windows::io::OwnedSocket>,
+    pending_handshakes: HashMap<std::os::windows::io::RawSocket, PendingHandshake>,
 }
 
 impl VhostUserVsockThread {
@@ -210,7 +252,7 @@ impl VhostUserVsockThread {
             #[cfg(all(windows, feature = "completion"))]
             port: None,
             #[cfg(all(windows, feature = "completion"))]
-            accepted_sockets: Vec::new(),
+            pending_handshakes: HashMap::new(),
         };
 
         for host_raw_fd in thread.host_listeners_map.keys() {
@@ -252,11 +294,7 @@ impl VhostUserVsockThread {
         }
     }
     /// Watch a descriptor for events in evset.
-    pub fn epoll_register(
-        registrar: &Registrar,
-        fd: RawDescriptor,
-        evset: EventSet,
-    ) -> Result<()> {
+    pub fn epoll_register(registrar: &Registrar, fd: RawDescriptor, evset: EventSet) -> Result<()> {
         registrar.register(fd, evset)
     }
 
@@ -311,21 +349,203 @@ impl VhostUserVsockThread {
     }
 
     /// Finish an accept `handle_completion` reported: extract the
-    /// connected socket, resubmit the listener's next accept, and stash
-    /// the socket in `accepted_sockets`.
+    /// connected socket, resubmit the listener's next accept, and start
+    /// reading the new connection's `"CONNECT <port>\n"` line (the host
+    /// application is a bridge peer, not the guest, so it has to say
+    /// which guest port it wants -- see `continue_handshake`).
     #[cfg(all(windows, feature = "completion"))]
     pub(crate) fn finish_accept(
         &mut self,
         mut operation: vmm_sys_util::completion::Operation,
     ) -> std::io::Result<()> {
+        use std::os::windows::io::{AsRawSocket, AsSocket};
+
+        let port = self
+            .port
+            .as_ref()
+            .expect("finish_accept called before attach_accept_loop")
+            .clone();
         let listener = self.unix_listener_socket()?;
         let accepted = vmm_sys_util::completion::socket::finish_accept(listener, &mut operation)?;
+        Self::submit_accept(&port, listener)?;
+
+        // The accepted socket is a different handle from the listener and
+        // is not associated with the port just because the listener is:
+        // association is per-handle, so its own receives would otherwise
+        // complete nowhere `port.wait()` ever looks.
+        vmm_sys_util::completion::socket::associate(&port, accepted.as_socket(), HOST_IO_KEY)?;
+
+        let raw = accepted.as_raw_socket();
+        self.pending_handshakes.insert(
+            raw,
+            PendingHandshake {
+                socket: accepted,
+                buf: Vec::new(),
+            },
+        );
+        self.submit_handshake_recv(raw)
+    }
+
+    /// How many host connections are accepted but still waiting for their
+    /// `"CONNECT <port>\n"` line. Test-only: production code has no need
+    /// to know the count, only the individual sockets.
+    #[cfg(all(test, windows, feature = "completion"))]
+    pub(crate) fn pending_handshake_count(&self) -> usize {
+        self.pending_handshakes.len()
+    }
+
+    /// Route a completion under [`HOST_IO_KEY`] to the handshake read it
+    /// continues or the established connection it was received for.
+    #[cfg(all(windows, feature = "completion"))]
+    pub(crate) fn handle_host_io_completion(
+        &mut self,
+        result: std::io::Result<usize>,
+        mut operation: vmm_sys_util::completion::Operation,
+    ) -> std::io::Result<()> {
+        let held = operation.take_held().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "a host I/O completion held nothing",
+            )
+        })?;
+        let io = held.downcast::<HostIo>().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "a host I/O completion held something other than HostIo",
+            )
+        })?;
+
+        match *io {
+            HostIo::Handshake(raw) => self.continue_handshake(raw, result, &operation),
+            HostIo::Connection(key) => self.continue_receive(key, result, &operation),
+        }
+    }
+
+    /// Append what a handshake receive returned; once a full
+    /// `"CONNECT <port>\n"` line is in, turn the socket into a tracked
+    /// connection. Resubmits the read if the line isn't complete yet.
+    #[cfg(all(windows, feature = "completion"))]
+    fn continue_handshake(
+        &mut self,
+        raw: std::os::windows::io::RawSocket,
+        result: std::io::Result<usize>,
+        operation: &vmm_sys_util::completion::Operation,
+    ) -> std::io::Result<()> {
+        let n = result?;
+        let Some(pending) = self.pending_handshakes.get_mut(&raw) else {
+            // Already torn down (e.g. the peer closed on an earlier read).
+            return Ok(());
+        };
+        if n == 0 {
+            self.pending_handshakes.remove(&raw);
+            return Ok(());
+        }
+        pending.buf.extend_from_slice(&operation.buffer()[..n]);
+
+        let Some(newline) = pending.buf.iter().position(|&b| b == b'\n') else {
+            return self.submit_handshake_recv(raw);
+        };
+        let line = pending.buf[..newline].to_vec();
+        let pending = self
+            .pending_handshakes
+            .remove(&raw)
+            .expect("looked up above");
+
+        let Some(peer_port) = parse_connect_line(&line) else {
+            warn!(
+                "vsock: malformed \"CONNECT PORT\" from a host connection: {:?}",
+                String::from_utf8_lossy(&line)
+            );
+            return Ok(());
+        };
+        let local_port = match self.allocate_local_port() {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("vsock: no free local port for a new host connection: {e:?}");
+                return Ok(());
+            }
+        };
+
         let port = self
             .port
             .clone()
-            .expect("finish_accept called before attach_accept_loop");
-        Self::submit_accept(&port, listener)?;
-        self.accepted_sockets.push(accepted);
+            .expect("attach must run before accepts complete");
+        let mut new_conn = crate::vsock_conn_win::VsockConnection::new_local_init(
+            pending.socket,
+            VSOCK_HOST_CID,
+            local_port,
+            self.guest_cid,
+            peer_port,
+            self.tx_buffer_size,
+            port,
+        );
+        new_conn.rx_queue.enqueue(RxOps::Request);
+        new_conn.set_peer_port(peer_port);
+
+        let conn_map_key = ConnMapKey::new(local_port, peer_port);
+        self.thread_backend
+            .win_conn_map
+            .insert(conn_map_key.clone(), new_conn);
+        self.thread_backend.backend_rxq.push_back(conn_map_key);
+        Ok(())
+    }
+
+    /// Submit (or resubmit) a receive for a socket still in
+    /// `pending_handshakes`.
+    #[cfg(all(windows, feature = "completion"))]
+    fn submit_handshake_recv(&self, raw: std::os::windows::io::RawSocket) -> std::io::Result<()> {
+        use std::os::windows::io::AsSocket;
+
+        let Some(pending) = self.pending_handshakes.get(&raw) else {
+            return Ok(());
+        };
+        let port = self
+            .port
+            .as_ref()
+            .expect("attach must run before accepts complete");
+        let mut operation = vmm_sys_util::completion::Operation::new(vec![0u8; 256]);
+        operation.hold(Box::new(HostIo::Handshake(raw)));
+        vmm_sys_util::completion::socket::recv(port, pending.socket.as_socket(), operation)?;
+        Ok(())
+    }
+
+    /// A receive completed for an established connection: stage its bytes,
+    /// tell the guest there is something to read, and chain the next
+    /// receive if credit allows. A zero-byte read or an error is treated
+    /// as the peer closing: enqueue `Reset` so the connection is cleaned
+    /// up the way an RST from the guest already is.
+    #[cfg(all(windows, feature = "completion"))]
+    fn continue_receive(
+        &mut self,
+        key: ConnMapKey,
+        result: std::io::Result<usize>,
+        operation: &vmm_sys_util::completion::Operation,
+    ) -> std::io::Result<()> {
+        let Some(conn) = self.thread_backend.win_conn_map.get_mut(&key) else {
+            return Ok(());
+        };
+        conn.recv_outstanding = false;
+
+        let n = match result {
+            Ok(n) => n,
+            Err(e) => {
+                warn!("vsock: receive failed for a host connection: {e:?}");
+                conn.rx_queue.enqueue(RxOps::Reset);
+                self.thread_backend.backend_rxq.push_back(key);
+                return Ok(());
+            }
+        };
+        if n == 0 {
+            conn.rx_queue.enqueue(RxOps::Reset);
+            self.thread_backend.backend_rxq.push_back(key);
+            return Ok(());
+        }
+
+        conn.rx_staging
+            .extend(operation.buffer()[..n].iter().copied());
+        conn.rx_queue.enqueue(RxOps::Rw);
+        self.thread_backend.backend_rxq.push_back(key);
+        conn.submit_recv_if_possible();
         Ok(())
     }
 
@@ -373,7 +593,8 @@ impl VhostUserVsockThread {
         }
         // SAFETY: `raw` was just created above and is owned by nothing
         // else.
-        let accepted = unsafe { std::os::windows::io::OwnedSocket::from_raw_socket(raw as RawSocket) };
+        let accepted =
+            unsafe { std::os::windows::io::OwnedSocket::from_raw_socket(raw as RawSocket) };
 
         vmm_sys_util::completion::socket::accept(
             port,
@@ -520,12 +741,8 @@ impl VhostUserVsockThread {
                         self.add_new_connection_from_host(fd, stream, local_port, peer_port);
 
                         // Re-register the fd to listen for EPOLLIN and EPOLLOUT events
-                        Self::epoll_modify(
-                            self.registrar(),
-                            fd,
-                            EventSet::IN | EventSet::OUT,
-                        )
-                        .unwrap();
+                        Self::epoll_modify(self.registrar(), fd, EventSet::IN | EventSet::OUT)
+                            .unwrap();
                     }
                 }
             } else {
@@ -545,8 +762,7 @@ impl VhostUserVsockThread {
                                 conn.rx_queue.enqueue(RxOps::CreditUpdate);
                             } else {
                                 // If no remaining data to flush, try to disable EPOLLOUT
-                                if Self::epoll_modify(&registrar, fd, EventSet::IN).is_err()
-                                {
+                                if Self::epoll_modify(&registrar, fd, EventSet::IN).is_err() {
                                     error!("Failed to disable EPOLLOUT");
                                 }
                             }
@@ -669,11 +885,7 @@ impl VhostUserVsockThread {
         self.thread_backend
             .stream_map
             .insert(stream_fd, StreamType::Unix(stream));
-        VhostUserVsockThread::epoll_register(
-            self.registrar(),
-            stream_fd,
-            EventSet::IN,
-        )?;
+        VhostUserVsockThread::epoll_register(self.registrar(), stream_fd, EventSet::IN)?;
 
         Ok(())
     }
@@ -931,9 +1143,9 @@ mod tests {
 
     use super::*;
     use crate::registrar::FIRST_HOST_EVENT;
-    use vmm_sys_util::epoll::Epoll;
     #[cfg(all(feature = "backend_vsock", unix))]
     use crate::vhu_vsock::VsockProxyInfo;
+    use vmm_sys_util::epoll::Epoll;
 
     const CONN_TX_BUF_SIZE: u32 = 64 * 1024;
 
@@ -978,15 +1190,18 @@ mod tests {
         VhostUserVsockThread::epoll_modify(&registrar, dummy_fd.as_raw_descriptor(), EventSet::IN)
             .unwrap();
         VhostUserVsockThread::epoll_unregister(&registrar, dummy_fd.as_raw_descriptor()).unwrap();
-        VhostUserVsockThread::epoll_register(&registrar, dummy_fd.as_raw_descriptor(), EventSet::IN)
-            .unwrap();
+        VhostUserVsockThread::epoll_register(
+            &registrar,
+            dummy_fd.as_raw_descriptor(),
+            EventSet::IN,
+        )
+        .unwrap();
         // Registered handles have to be removed before they are closed.
         // Closing first implicitly removes an fd from a Linux epoll, so
         // leaving this to the drop below is harmless there; on Windows it
         // leaves a thread-pool wait on a closed handle and takes the
         // process down.
-        VhostUserVsockThread::epoll_unregister(&registrar, dummy_fd.as_raw_descriptor())
-            .unwrap();
+        VhostUserVsockThread::epoll_unregister(&registrar, dummy_fd.as_raw_descriptor()).unwrap();
 
         let vring = VringRwLock::new(mem, 0x1000).unwrap();
         vring.set_queue_info(0x100, 0x200, 0x300).unwrap();
@@ -1245,7 +1460,8 @@ mod tests {
         // the stream would never be registered again and readiness on it
         // would stop being observed entirely.
         assert!(
-            VhostUserVsockThread::epoll_modify(&registrar, fd, EventSet::IN | EventSet::OUT).is_err(),
+            VhostUserVsockThread::epoll_modify(&registrar, fd, EventSet::IN | EventSet::OUT)
+                .is_err(),
             "modify must report an unregistered stream, or the fallback never runs"
         );
 

@@ -22,8 +22,7 @@ use vmm_sys_util::{
     eventfd::EventFd,
 };
 
-use crate::{
-    registrar::FIRST_HOST_EVENT,thread_backend::RawPktsQ, vhu_vsock_thread::*};
+use crate::{registrar::FIRST_HOST_EVENT, thread_backend::RawPktsQ, vhu_vsock_thread::*};
 
 pub(crate) type CidMap =
     HashMap<u64, (Arc<RwLock<RawPktsQ>>, Arc<RwLock<HashSet<String>>>, EventFd)>;
@@ -77,6 +76,12 @@ const QUEUE_MASK: u64 = 0b11;
 pub(crate) type Result<T> = std::result::Result<T, Error>;
 
 /// Custom error types
+// A Windows build with the `completion` feature no longer constructs a few
+// of these (the ones only ever produced by the now Unix/epoll-only host
+// socket path in `vsock_conn.rs`/`thread_backend.rs`, ADR-0001 action item
+// 5); which ones drifts stage by stage, so this is allowed at the enum
+// level rather than variant by variant.
+#[cfg_attr(all(windows, feature = "completion"), allow(dead_code))]
 #[derive(Debug, ThisError)]
 pub(crate) enum Error {
     #[error("Failed to handle event other than EPOLLIN event")]
@@ -489,7 +494,11 @@ impl vhost_user_backend::VhostUserCompletionBackend for VhostUserVsockBackend {
     /// (ADR-0001 action item 5, stage 2). The host-socket side (accepts,
     /// receives, sends) still has no completion-loop implementation; that
     /// is the rest of action item 5.
-    fn attach(&self, thread_index: usize, port: Arc<vmm_sys_util::completion::Port>) -> IoResult<()> {
+    fn attach(
+        &self,
+        thread_index: usize,
+        port: Arc<vmm_sys_util::completion::Port>,
+    ) -> IoResult<()> {
         use std::os::windows::io::AsHandle;
 
         let mut thread = self.threads[thread_index].lock().unwrap();
@@ -500,12 +509,7 @@ impl vhost_user_backend::VhostUserCompletionBackend for VhostUserVsockBackend {
         thread.attach_accept_loop(port)
     }
 
-    fn handle_kick(
-        &self,
-        vring: u16,
-        vrings: &[VringRwLock],
-        thread_id: usize,
-    ) -> IoResult<()> {
+    fn handle_kick(&self, vring: u16, vrings: &[VringRwLock], thread_id: usize) -> IoResult<()> {
         self.process_kicked_queue(vring, vrings, thread_id)
     }
 
@@ -542,6 +546,14 @@ impl vhost_user_backend::VhostUserCompletionBackend for VhostUserVsockBackend {
                 result?;
                 let mut thread = self.threads[thread_id].lock().unwrap();
                 thread.finish_accept(operation)
+            }
+            vmm_sys_util::completion::Completion::Operation {
+                key,
+                result,
+                operation,
+            } if key == crate::vhu_vsock_thread::HOST_IO_KEY => {
+                let mut thread = self.threads[thread_id].lock().unwrap();
+                thread.handle_host_io_completion(result, operation)
             }
             other => Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -893,10 +905,12 @@ mod tests {
             bytes: 0,
             pointer: 0,
         };
-        assert!(vhost_user_backend::VhostUserCompletionBackend::handle_completion(
-            &backend, unexpected, &vrings, 0,
-        )
-        .is_err());
+        assert!(
+            vhost_user_backend::VhostUserCompletionBackend::handle_completion(
+                &backend, unexpected, &vrings, 0,
+            )
+            .is_err()
+        );
 
         let _ = std::fs::remove_file(vhost_socket_path);
         let _ = std::fs::remove_file(vsock_socket_path);
@@ -936,9 +950,16 @@ mod tests {
         vhost_user_backend::VhostUserCompletionBackend::attach(&backend, 0, port.clone())
             .expect("attach should submit the listener's first accept");
 
+        // Kept alive for the whole test: since stage 4, finishing an
+        // accept also submits a handshake receive, and dropping a client
+        // early would complete that receive too (peer closed), adding an
+        // unrelated completion to a later `wait` this test isn't about.
+        let mut clients = Vec::new();
         for expected_count in 1..=2 {
-            let _client = UnixStream::connect(&vsock_socket_path)
-                .expect("the listener should be accepting connections");
+            clients.push(
+                UnixStream::connect(&vsock_socket_path)
+                    .expect("the listener should be accepting connections"),
+            );
 
             let mut completions = Vec::new();
             port.wait(Some(Duration::from_secs(5)), &mut completions)
@@ -954,11 +975,146 @@ mod tests {
             )
             .expect("finish_accept should succeed and resubmit the next accept");
 
+            // The test client never sends "CONNECT <port>\n", so each
+            // connection stays a pending handshake rather than becoming a
+            // tracked connection -- this test is only about the accept
+            // mechanics (stage 3), not the handshake (stage 4's own test
+            // covers that).
             assert_eq!(
-                backend.threads[0].lock().unwrap().accepted_sockets.len(),
+                backend.threads[0].lock().unwrap().pending_handshake_count(),
                 expected_count,
-                "each connection should add exactly one tracked socket"
+                "each connection should add exactly one pending handshake"
             );
+        }
+
+        let _ = std::fs::remove_file(vhost_socket_path);
+        let _ = std::fs::remove_file(vsock_socket_path);
+        test_dir.close().unwrap();
+    }
+
+    /// ADR-0001 action item 5, stage 4: a host connection's
+    /// `"CONNECT <port>\n"` line turns it into a tracked connection in
+    /// `win_conn_map`, and once the guest has (in this test, simulated)
+    /// granted credit, a receive completion stages bytes for it to read.
+    #[cfg(all(windows, feature = "completion"))]
+    #[test]
+    fn completion_handshake_and_receive_track_a_real_connection() {
+        use std::{io::Write, time::Duration};
+
+        use uds_windows::UnixStream;
+        use vmm_sys_util::completion::Port;
+
+        use crate::rxops::RxOps;
+
+        const CID: u64 = 3;
+        let groups_list: Vec<String> = vec![String::from("default")];
+        let test_dir = tempdir().expect("Could not create a temp test directory.");
+        let vhost_socket_path = test_dir.path().join("test_completion_handshake.socket");
+        let vsock_socket_path = test_dir.path().join("test_completion_handshake.vsock");
+        let cid_map: Arc<RwLock<CidMap>> = Arc::new(RwLock::new(HashMap::new()));
+
+        let config = VsockConfig::new(
+            CID,
+            vhost_socket_path.clone(),
+            BackendType::UnixDomainSocket(vsock_socket_path.clone()),
+            CONN_TX_BUF_SIZE,
+            QUEUE_SIZE,
+            groups_list,
+        );
+        let backend = VhostUserVsockBackend::new(config, cid_map).unwrap();
+
+        let port = Arc::new(Port::new().unwrap());
+        vhost_user_backend::VhostUserCompletionBackend::attach(&backend, 0, port.clone()).unwrap();
+
+        let mut client = UnixStream::connect(&vsock_socket_path).unwrap();
+
+        // The accept.
+        let mut completions = Vec::new();
+        port.wait(Some(Duration::from_secs(5)), &mut completions)
+            .unwrap();
+        let completion = completions.pop().unwrap();
+        vhost_user_backend::VhostUserCompletionBackend::handle_completion(
+            &backend,
+            completion,
+            &[],
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            backend.threads[0].lock().unwrap().pending_handshake_count(),
+            1
+        );
+
+        // The "CONNECT <port>\n" handshake.
+        client.write_all(b"CONNECT 1234\n").unwrap();
+        completions.clear();
+        port.wait(Some(Duration::from_secs(5)), &mut completions)
+            .unwrap();
+        assert_eq!(completions.len(), 1);
+        let completion = completions.pop().unwrap();
+        vhost_user_backend::VhostUserCompletionBackend::handle_completion(
+            &backend,
+            completion,
+            &[],
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            backend.threads[0].lock().unwrap().pending_handshake_count(),
+            0,
+            "a completed handshake should stop being pending"
+        );
+        let local_port = {
+            let thread = backend.threads[0].lock().unwrap();
+            assert_eq!(thread.thread_backend.win_conn_map.len(), 1);
+            let conn = thread.thread_backend.win_conn_map.values().next().unwrap();
+            assert_eq!(conn.peer_port, 1234, "the requested guest port");
+            assert!(
+                thread
+                    .thread_backend
+                    .backend_rxq
+                    .contains(&ConnMapKey::new(conn.local_port, 1234)),
+                "the new connection should have a Request queued for the guest"
+            );
+            conn.local_port
+        };
+
+        // Simulate the guest's VSOCK_OP_RESPONSE having arrived: connected,
+        // with credit -- which is what lets a receive be submitted at all.
+        {
+            let mut thread = backend.threads[0].lock().unwrap();
+            let key = ConnMapKey::new(local_port, 1234);
+            let conn = thread.thread_backend.win_conn_map.get_mut(&key).unwrap();
+            conn.connect = true;
+            conn.peer_buf_alloc = 65536;
+            conn.submit_recv_if_possible();
+        }
+
+        client.write_all(b"hello").unwrap();
+        completions.clear();
+        port.wait(Some(Duration::from_secs(5)), &mut completions)
+            .unwrap();
+        assert_eq!(completions.len(), 1);
+        let completion = completions.pop().unwrap();
+        vhost_user_backend::VhostUserCompletionBackend::handle_completion(
+            &backend,
+            completion,
+            &[],
+            0,
+        )
+        .unwrap();
+
+        {
+            let mut thread = backend.threads[0].lock().unwrap();
+            let key = ConnMapKey::new(local_port, 1234);
+            let conn = thread.thread_backend.win_conn_map.get_mut(&key).unwrap();
+            assert_eq!(Vec::from(conn.rx_staging.clone()), b"hello");
+            // The handshake's own Request is still queued too (nothing in
+            // this test ever dequeued it by calling recv_pkt), and Request
+            // outranks Rw in RxQueue's priority order, so check `contains`
+            // rather than `peek`.
+            assert!(conn.rx_queue.contains(RxOps::Rw.bitmask()));
         }
 
         let _ = std::fs::remove_file(vhost_socket_path);

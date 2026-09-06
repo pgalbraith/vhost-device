@@ -28,6 +28,14 @@ use crate::{
     vhu_vsock_thread::VhostUserVsockThread,
 };
 
+// Most of this type's fields go unread on a Windows build with the
+// `completion` feature: `new_local_init` still constructs one (from the
+// still-compiled epoll dispatch chain in `vhu_vsock_thread.rs`), but
+// nothing in this build ever calls `recv_pkt`/`send_pkt` on it to read
+// them back (ADR-0001 action item 5 uses `vsock_conn_win::VsockConnection`
+// there instead). It stays for Unix and the Windows-without-completion
+// build.
+#[cfg_attr(all(windows, feature = "completion"), allow(dead_code))]
 pub(crate) struct VsockConnection<S> {
     /// Host-side stream corresponding to this vsock connection.
     pub stream: S,
@@ -61,6 +69,9 @@ pub(crate) struct VsockConnection<S> {
     tx_buffer_size: u32,
 }
 
+// See the struct's own doc comment for why most of these go unused on a
+// Windows build with the `completion` feature.
+#[cfg_attr(all(windows, feature = "completion"), allow(dead_code))]
 impl<S: AsRawDescriptor + ReadVolatile + Write + WriteVolatile + IsHybridVsock> VsockConnection<S> {
     /// Create a new vsock connection object for locally i.e host-side
     /// inititated connections.
@@ -399,13 +410,13 @@ impl<S: AsRawDescriptor + ReadVolatile + Write + WriteVolatile + IsHybridVsock> 
 
 #[cfg(test)]
 mod tests {
-    use vmm_sys_util::epoll::Epoll;
     use std::{
         collections::VecDeque,
         io::{Read, Result as IoResult},
         ops::Deref,
         sync::{Arc, Mutex},
     };
+    use vmm_sys_util::epoll::Epoll;
 
     use byteorder::{ByteOrder, LittleEndian};
     use virtio_bindings::bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
@@ -957,7 +968,10 @@ mod tests {
         assert_eq!(pkt.len(), 5);
         let buf = &mut [0u8; 5];
         pkt.data_slice().unwrap().read_slice(buf, 0).unwrap();
-        assert_eq!(buf, b"hello", "the bytes the host wrote should reach the guest");
+        assert_eq!(
+            buf, b"hello",
+            "the bytes the host wrote should reach the guest"
+        );
         assert_eq!(conn.rx_cnt, Wrapping(5));
 
         // The stream is registered by recv_pkt; remove it before it closes.

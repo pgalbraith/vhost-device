@@ -9,6 +9,7 @@ use std::{
 };
 
 use log::{info, warn};
+#[cfg(not(all(windows, feature = "completion")))]
 use vmm_sys_util::epoll::EventSet;
 
 use crate::platform::{
@@ -21,6 +22,8 @@ use vm_memory::{
 #[cfg(all(feature = "backend_vsock", unix))]
 use vsock::VsockStream;
 
+#[cfg(not(all(windows, feature = "completion")))]
+use crate::vhu_vsock_thread::VhostUserVsockThread;
 use crate::{
     registrar::Registrar,
     rxops::*,
@@ -28,7 +31,6 @@ use crate::{
         BackendType, CidMap, ConnMapKey, Error, Result, VSOCK_HOST_CID, VSOCK_OP_REQUEST,
         VSOCK_OP_RST, VSOCK_TYPE_STREAM,
     },
-    vhu_vsock_thread::VhostUserVsockThread,
     vsock_conn::*,
 };
 
@@ -64,6 +66,11 @@ pub(crate) enum StreamType {
 }
 
 impl StreamType {
+    // Unused on a Windows build with the `completion` feature: nothing
+    // constructs a `StreamType` there any more (ADR-0001 action item 5,
+    // stage 4). It stays for Unix and the Windows-without-completion
+    // build.
+    #[cfg_attr(all(windows, feature = "completion"), allow(dead_code))]
     fn try_clone(&self) -> StdIOResult<StreamType> {
         match self {
             StreamType::Unix(stream) => {
@@ -188,9 +195,33 @@ pub(crate) trait IsHybridVsock {
 }
 
 impl IsHybridVsock for StreamType {
+    // Unused on a Windows build with the `completion` feature; see
+    // `StreamType::try_clone`.
+    #[cfg_attr(all(windows, feature = "completion"), allow(dead_code))]
     fn is_hybrid_vsock(&self) -> bool {
         matches!(self, StreamType::Unix(_))
     }
+}
+
+/// Fill in an RST packet for a connection that is going away. Shared by
+/// `recv_pkt_unix` and `recv_pkt_win`, which differ only in how (or
+/// whether) they undo the connection's registration first.
+fn set_rst_pkt<B: BitmapSlice>(
+    pkt: &mut VsockPacket<B>,
+    guest_cid: u64,
+    local_port: u32,
+    peer_port: u32,
+) {
+    pkt.set_op(VSOCK_OP_RST)
+        .set_src_cid(VSOCK_HOST_CID)
+        .set_dst_cid(guest_cid)
+        .set_src_port(local_port)
+        .set_dst_port(peer_port)
+        .set_len(0)
+        .set_type(VSOCK_TYPE_STREAM)
+        .set_flags(0)
+        .set_buf_alloc(0)
+        .set_fwd_cnt(0);
 }
 
 pub(crate) struct VsockThreadBackend {
@@ -205,11 +236,20 @@ pub(crate) struct VsockThreadBackend {
     /// Host side socket info for listening to new connections from the host.
     backend_info: BackendType,
     /// Where new host-side connections are registered for readiness.
+    ///
+    /// Unused on a Windows build with the `completion` feature: only
+    /// `add_new_guest_conn` reads it, and that's Unix/epoll-only now (see
+    /// its own doc comment).
+    #[cfg_attr(all(windows, feature = "completion"), allow(dead_code))]
     registrar: Arc<Registrar>,
     /// CID of the guest.
     guest_cid: u64,
     /// Set of allocated local ports.
     pub local_port_set: HashSet<u32>,
+    /// Unused on a Windows build with the `completion` feature; see
+    /// `registrar` above. (`VhostUserVsockThread` has its own copy that
+    /// stays live, used to build `vsock_conn_win::VsockConnection`s.)
+    #[cfg_attr(all(windows, feature = "completion"), allow(dead_code))]
     tx_buffer_size: u32,
     /// Maps the guest CID to the corresponding backend. Used for sibling VM
     /// communication.
@@ -220,6 +260,18 @@ pub(crate) struct VsockThreadBackend {
     /// Set of groups assigned to the device which it is allowed to communicate
     /// with.
     groups_set: Arc<RwLock<HashSet<String>>>,
+    /// Host connections accepted on the completion loop (ADR-0001 action
+    /// item 5), keyed the same way as `conn_map`.
+    ///
+    /// Kept as a separate map rather than changing `conn_map`'s value
+    /// type, so every existing epoll-path method that constructs a
+    /// `VsockConnection<StreamType>` -- `add_new_connection_from_host`,
+    /// `add_new_guest_conn`, the `VhostUserBackend` trait's `handle_event`
+    /// -- keeps compiling unchanged on a Windows build with the
+    /// `completion` feature. They simply have nothing to do on that
+    /// build, the same as `listener_map`/`stream_map` already do.
+    #[cfg(all(windows, feature = "completion"))]
+    pub win_conn_map: HashMap<ConnMapKey, crate::vsock_conn_win::VsockConnection>,
 }
 
 impl VsockThreadBackend {
@@ -247,6 +299,8 @@ impl VsockThreadBackend {
             cid_map,
             raw_pkts_queue: Arc::new(RwLock::new(VecDeque::new())),
             groups_set,
+            #[cfg(all(windows, feature = "completion"))]
+            win_conn_map: HashMap::new(),
         }
     }
 
@@ -268,6 +322,18 @@ impl VsockThreadBackend {
     pub fn recv_pkt<B: BitmapSlice>(&mut self, pkt: &mut VsockPacket<B>) -> Result<()> {
         // Pop an event from the backend_rxq
         let key = self.backend_rxq.pop_front().ok_or(Error::EmptyBackendRxQ)?;
+        #[cfg(all(windows, feature = "completion"))]
+        return self.recv_pkt_win(key, pkt);
+        #[cfg(not(all(windows, feature = "completion")))]
+        return self.recv_pkt_unix(key, pkt);
+    }
+
+    #[cfg(not(all(windows, feature = "completion")))]
+    fn recv_pkt_unix<B: BitmapSlice>(
+        &mut self,
+        key: ConnMapKey,
+        pkt: &mut VsockPacket<B>,
+    ) -> Result<()> {
         let conn = match self.conn_map.get_mut(&key) {
             Some(conn) => conn,
             None => {
@@ -282,33 +348,51 @@ impl VsockThreadBackend {
             self.listener_map.remove(&conn.stream.as_raw_descriptor());
             self.stream_map.remove(&conn.stream.as_raw_descriptor());
             self.local_port_set.remove(&conn.local_port);
-            VhostUserVsockThread::epoll_unregister(&conn.registrar, conn.stream.as_raw_descriptor())
-                .unwrap_or_else(|err| {
-                    warn!(
-                        "Could not remove epoll listener for fd {:?}: {:?}",
-                        conn.stream.as_raw_descriptor(),
-                        err
-                    )
-                });
+            VhostUserVsockThread::epoll_unregister(
+                &conn.registrar,
+                conn.stream.as_raw_descriptor(),
+            )
+            .unwrap_or_else(|err| {
+                warn!(
+                    "Could not remove epoll listener for fd {:?}: {:?}",
+                    conn.stream.as_raw_descriptor(),
+                    err
+                )
+            });
 
-            // Initialize the packet header to contain a VSOCK_OP_RST operation
-            pkt.set_op(VSOCK_OP_RST)
-                .set_src_cid(VSOCK_HOST_CID)
-                .set_dst_cid(conn.guest_cid)
-                .set_src_port(conn.local_port)
-                .set_dst_port(conn.peer_port)
-                .set_len(0)
-                .set_type(VSOCK_TYPE_STREAM)
-                .set_flags(0)
-                .set_buf_alloc(0)
-                .set_fwd_cnt(0);
-
+            set_rst_pkt(pkt, conn.guest_cid, conn.local_port, conn.peer_port);
             return Ok(());
         }
 
         // Handle other packet types per connection
         conn.recv_pkt(pkt)?;
 
+        Ok(())
+    }
+
+    /// The completion loop's counterpart of `recv_pkt_unix`, over
+    /// `win_conn_map` instead of `conn_map`. No registrar or fd bookkeeping
+    /// to undo on RST: a Windows connection was never registered with one
+    /// (ADR-0001 action item 5).
+    #[cfg(all(windows, feature = "completion"))]
+    fn recv_pkt_win<B: BitmapSlice>(
+        &mut self,
+        key: ConnMapKey,
+        pkt: &mut VsockPacket<B>,
+    ) -> Result<()> {
+        let conn = match self.win_conn_map.get_mut(&key) {
+            Some(conn) => conn,
+            None => return Ok(()),
+        };
+
+        if conn.rx_queue.peek() == Some(RxOps::Reset) {
+            let conn = self.win_conn_map.remove(&key).unwrap();
+            self.local_port_set.remove(&conn.local_port);
+            set_rst_pkt(pkt, conn.guest_cid, conn.local_port, conn.peer_port);
+            return Ok(());
+        }
+
+        conn.recv_pkt(pkt)?;
         Ok(())
     }
 
@@ -368,6 +452,18 @@ impl VsockThreadBackend {
 
         let key = ConnMapKey::new(pkt.dst_port(), pkt.src_port());
 
+        #[cfg(all(windows, feature = "completion"))]
+        return self.send_pkt_win(key, pkt);
+        #[cfg(not(all(windows, feature = "completion")))]
+        return self.send_pkt_unix(key, pkt);
+    }
+
+    #[cfg(not(all(windows, feature = "completion")))]
+    fn send_pkt_unix<B: BitmapSlice>(
+        &mut self,
+        key: ConnMapKey,
+        pkt: &VsockPacket<B>,
+    ) -> Result<()> {
         // TODO: Handle cases where connection does not exist and packet op
         // is not VSOCK_OP_REQUEST
         if !self.conn_map.contains_key(&key) {
@@ -390,14 +486,17 @@ impl VsockThreadBackend {
             self.listener_map.remove(&conn.stream.as_raw_descriptor());
             self.stream_map.remove(&conn.stream.as_raw_descriptor());
             self.local_port_set.remove(&conn.local_port);
-            VhostUserVsockThread::epoll_unregister(&conn.registrar, conn.stream.as_raw_descriptor())
-                .unwrap_or_else(|err| {
-                    warn!(
-                        "Could not remove epoll listener for fd {:?}: {:?}",
-                        conn.stream.as_raw_descriptor(),
-                        err
-                    )
-                });
+            VhostUserVsockThread::epoll_unregister(
+                &conn.registrar,
+                conn.stream.as_raw_descriptor(),
+            )
+            .unwrap_or_else(|err| {
+                warn!(
+                    "Could not remove epoll listener for fd {:?}: {:?}",
+                    conn.stream.as_raw_descriptor(),
+                    err
+                )
+            });
             return Ok(());
         }
 
@@ -411,6 +510,56 @@ impl VsockThreadBackend {
         }
 
         Ok(())
+    }
+
+    /// The completion loop's counterpart of `send_pkt_unix`, over
+    /// `win_conn_map` instead of `conn_map`. Guest-initiated connections
+    /// (`handle_new_guest_conn`) aren't implemented on this loop yet
+    /// (ADR-0001 action item 5, stage 6).
+    #[cfg(all(windows, feature = "completion"))]
+    fn send_pkt_win<B: BitmapSlice>(
+        &mut self,
+        key: ConnMapKey,
+        pkt: &VsockPacket<B>,
+    ) -> Result<()> {
+        if !self.win_conn_map.contains_key(&key) {
+            if pkt.op() == VSOCK_OP_REQUEST {
+                self.handle_new_guest_conn(pkt);
+            }
+            return Ok(());
+        }
+
+        if pkt.op() == VSOCK_OP_RST {
+            let conn = self.win_conn_map.get(&key).unwrap();
+            if conn.rx_queue.contains(RxOps::Reset.bitmask()) {
+                return Ok(());
+            }
+            let conn = self.win_conn_map.remove(&key).unwrap();
+            self.local_port_set.remove(&conn.local_port);
+            return Ok(());
+        }
+
+        let conn = self.win_conn_map.get_mut(&key).unwrap();
+        conn.send_pkt(pkt)?;
+
+        if conn.rx_queue.pending_rx() {
+            self.backend_rxq.push_back(key);
+        }
+
+        Ok(())
+    }
+
+    /// Guest-initiated connections on the completion loop are not yet
+    /// implemented (ADR-0001 action item 5, stage 6: a blocking connect to
+    /// `{uds_path}_{port}`, per ADR-0001's "effectively instant...
+    /// `ConnectEx` is not verified and is not required"). Refuse the
+    /// request rather than silently dropping it.
+    #[cfg(all(windows, feature = "completion"))]
+    fn handle_new_guest_conn<B: BitmapSlice>(&mut self, _pkt: &VsockPacket<B>) {
+        warn!(
+            "vsock: guest-initiated connections are not yet implemented on the completion loop \
+             (ADR-0001 action item 5)"
+        );
     }
 
     /// Deliver a raw vsock packet sent from a sibling VM to the guest vsock
@@ -446,6 +595,7 @@ impl VsockThreadBackend {
     ///
     /// In case of proxying using vosck, attempts to connect to the
     /// {forward_cid, local_port}
+    #[cfg(not(all(windows, feature = "completion")))]
     fn handle_new_guest_conn<B: BitmapSlice>(&mut self, pkt: &VsockPacket<B>) {
         match &self.backend_info {
             BackendType::UnixDomainSocket(uds_path) => {
@@ -468,6 +618,7 @@ impl VsockThreadBackend {
     }
 
     /// Wrapper to add new connection to relevant HashMaps.
+    #[cfg(not(all(windows, feature = "completion")))]
     fn add_new_guest_conn<B: BitmapSlice>(
         &mut self,
         stream: StreamType,
@@ -508,6 +659,7 @@ impl VsockThreadBackend {
     }
 
     /// Enqueue RST packets to be sent to guest.
+    #[cfg(not(all(windows, feature = "completion")))]
     fn enq_rst(&mut self) {
         // TODO
         log::debug!("New guest conn error: Enqueue RST");
@@ -516,8 +668,8 @@ impl VsockThreadBackend {
 
 #[cfg(test)]
 mod tests {
-    use vmm_sys_util::epoll::Epoll;
     use crate::platform::UnixListener;
+    use vmm_sys_util::epoll::Epoll;
 
     use tempfile::tempdir;
     use virtio_vsock::packet::{VsockPacket, PKT_HEADER_SIZE};
@@ -585,9 +737,22 @@ mod tests {
         packet.set_op(VSOCK_OP_RST);
         vtp.send_pkt(&packet).unwrap();
 
+        // On Unix, the REQUEST above connected for real (the test binds
+        // `vsock_peer_path` as a listener first) and pushed to
+        // `backend_rxq`. On a Windows completion build, guest-initiated
+        // connections aren't implemented yet (ADR-0001 action item 5,
+        // stage 6), so `handle_new_guest_conn` is a no-op and nothing was
+        // ever pushed.
+        #[cfg(not(all(windows, feature = "completion")))]
         vtp.recv_pkt(&mut packet).unwrap();
+        #[cfg(all(windows, feature = "completion"))]
+        assert_eq!(
+            vtp.recv_pkt(&mut packet).unwrap_err().to_string(),
+            Error::EmptyBackendRxQ.to_string()
+        );
 
         // TODO: it is a nop for now
+        #[cfg(not(all(windows, feature = "completion")))]
         vtp.enq_rst();
     }
 

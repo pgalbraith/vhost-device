@@ -38,6 +38,11 @@ impl LocalTxBuf {
 
     /// Add new data to the tx buffer, push all or none.
     /// Returns LocalTxBufFull error if space not sufficient.
+    ///
+    /// Unused on a Windows build with the `completion` feature until
+    /// ADR-0001 action item 5's guest-to-host send path (stage 5) lands;
+    /// `vsock_conn_win::VsockConnection` already carries a `tx_buf` for it.
+    #[cfg_attr(all(windows, feature = "completion"), allow(dead_code))]
     pub fn push<B: BitmapSlice>(&mut self, data_buf: &VolatileSlice<B>) -> Result<()> {
         if self.get_buf_size() as usize - self.len() < data_buf.len() {
             // Tx buffer is full

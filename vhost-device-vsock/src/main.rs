@@ -46,6 +46,8 @@ mod txbuf;
 mod vhu_vsock;
 mod vhu_vsock_thread;
 mod vsock_conn;
+#[cfg(all(windows, feature = "completion"))]
+mod vsock_conn_win;
 
 use std::{
     any::Any,
