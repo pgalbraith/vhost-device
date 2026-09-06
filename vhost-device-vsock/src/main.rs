@@ -1114,14 +1114,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        all(windows, feature = "completion"),
-        ignore = "assumes the winning thread blocks forever in daemon.serve(), which needs \
-                  VhostUserCompletionBackend::attach to actually succeed (ADR-0001 action item \
-                  5 is still in progress); until then it fails fast too and races the losing \
-                  thread's CidAlreadyInUse, making the assertion flaky. Remove this once attach \
-                  has a real implementation."
-    )]
     fn test_start_backend_servers_failure() {
         const CONN_TX_BUF_SIZE: u32 = 64 * 1024;
         const QUEUE_SIZE: usize = 1024;

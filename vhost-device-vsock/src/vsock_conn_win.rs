@@ -109,6 +109,46 @@ impl VsockConnection {
         }
     }
 
+    /// A connection for a guest-initiated request (ADR-0001 action item 5,
+    /// stage 6): the backend has already connected to the host
+    /// application `pkt.dst_port()` names, and a `VSOCK_OP_RESPONSE` is
+    /// queued to tell the guest so. See
+    /// `vsock_conn::VsockConnection::new_peer_init`, which this mirrors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_peer_init(
+        socket: OwnedSocket,
+        local_cid: u64,
+        local_port: u32,
+        guest_cid: u64,
+        guest_port: u32,
+        peer_buf_alloc: u32,
+        tx_buffer_size: u32,
+        port: Arc<Port>,
+    ) -> Self {
+        let mut rx_queue = RxQueue::new();
+        rx_queue.enqueue(RxOps::Response);
+        Self {
+            socket,
+            connect: false,
+            peer_port: guest_port,
+            rx_queue,
+            local_cid,
+            local_port,
+            guest_cid,
+            fwd_cnt: Wrapping(0),
+            last_fwd_cnt: Wrapping(0),
+            peer_buf_alloc,
+            peer_fwd_cnt: Wrapping(0),
+            rx_cnt: Wrapping(0),
+            tx_buf: LocalTxBuf::new(tx_buffer_size),
+            tx_buffer_size,
+            rx_staging: VecDeque::new(),
+            recv_outstanding: false,
+            send_outstanding: false,
+            port,
+        }
+    }
+
     /// Set the peer port to the guest side application's port.
     pub fn set_peer_port(&mut self, peer_port: u32) {
         self.peer_port = peer_port;
@@ -172,6 +212,14 @@ impl VsockConnection {
             Some(RxOps::Response) => {
                 self.connect = true;
                 pkt.set_op(VSOCK_OP_RESPONSE);
+                // A guest-initiated connection (`new_peer_init`) already
+                // has peer credit at this point, since it came with the
+                // guest's original request -- unlike a host-initiated one,
+                // which has to wait for this same packet's `VSOCK_OP_RESPONSE`
+                // to reach the guest and a reply to come back. Try now
+                // rather than waiting for some unrelated later packet to
+                // trigger it.
+                self.submit_recv_if_possible();
                 Ok(())
             }
             Some(RxOps::CreditUpdate) => {

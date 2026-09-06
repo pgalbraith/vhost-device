@@ -246,10 +246,6 @@ pub(crate) struct VsockThreadBackend {
     guest_cid: u64,
     /// Set of allocated local ports.
     pub local_port_set: HashSet<u32>,
-    /// Unused on a Windows build with the `completion` feature; see
-    /// `registrar` above. (`VhostUserVsockThread` has its own copy that
-    /// stays live, used to build `vsock_conn_win::VsockConnection`s.)
-    #[cfg_attr(all(windows, feature = "completion"), allow(dead_code))]
     tx_buffer_size: u32,
     /// Maps the guest CID to the corresponding backend. Used for sibling VM
     /// communication.
@@ -272,6 +268,13 @@ pub(crate) struct VsockThreadBackend {
     /// build, the same as `listener_map`/`stream_map` already do.
     #[cfg(all(windows, feature = "completion"))]
     pub win_conn_map: HashMap<ConnMapKey, crate::vsock_conn_win::VsockConnection>,
+    /// The worker's completion port, set once by
+    /// `VhostUserVsockThread::attach_accept_loop`. `handle_new_guest_conn`
+    /// needs it to associate a freshly connected socket; nothing else here
+    /// does, since accepted connections arrive already associated (see
+    /// `VhostUserVsockThread::continue_handshake`).
+    #[cfg(all(windows, feature = "completion"))]
+    port: Option<Arc<vmm_sys_util::completion::Port>>,
 }
 
 impl VsockThreadBackend {
@@ -301,7 +304,17 @@ impl VsockThreadBackend {
             groups_set,
             #[cfg(all(windows, feature = "completion"))]
             win_conn_map: HashMap::new(),
+            #[cfg(all(windows, feature = "completion"))]
+            port: None,
         }
+    }
+
+    /// Give this backend the worker's completion port, for
+    /// `handle_new_guest_conn` to associate a freshly connected socket
+    /// with. Called once from `VhostUserVsockThread::attach_accept_loop`.
+    #[cfg(all(windows, feature = "completion"))]
+    pub(crate) fn set_port(&mut self, port: Arc<vmm_sys_util::completion::Port>) {
+        self.port = Some(port);
     }
 
     /// Checks if there are pending rx requests in the backend rxq.
@@ -513,9 +526,7 @@ impl VsockThreadBackend {
     }
 
     /// The completion loop's counterpart of `send_pkt_unix`, over
-    /// `win_conn_map` instead of `conn_map`. Guest-initiated connections
-    /// (`handle_new_guest_conn`) aren't implemented on this loop yet
-    /// (ADR-0001 action item 5, stage 6).
+    /// `win_conn_map` instead of `conn_map`.
     #[cfg(all(windows, feature = "completion"))]
     fn send_pkt_win<B: BitmapSlice>(
         &mut self,
@@ -549,17 +560,68 @@ impl VsockThreadBackend {
         Ok(())
     }
 
-    /// Guest-initiated connections on the completion loop are not yet
-    /// implemented (ADR-0001 action item 5, stage 6: a blocking connect to
-    /// `{uds_path}_{port}`, per ADR-0001's "effectively instant...
-    /// `ConnectEx` is not verified and is not required"). Refuse the
-    /// request rather than silently dropping it.
+    /// Guest-initiated connections on the completion loop (ADR-0001 action
+    /// item 5, stage 6): connect to the host application at
+    /// `{uds_path}_{port}`, the same address `add_new_guest_conn` connects
+    /// to on the epoll path. The connect is blocking, per ADR-0001: "a
+    /// blocking connect to a local listener is effectively instant...
+    /// `ConnectEx` is not verified and is not required". AF_VSOCK
+    /// forwarding is Unix-only, so this crate's only Windows backend is
+    /// the UDS one.
     #[cfg(all(windows, feature = "completion"))]
-    fn handle_new_guest_conn<B: BitmapSlice>(&mut self, _pkt: &VsockPacket<B>) {
-        warn!(
-            "vsock: guest-initiated connections are not yet implemented on the completion loop \
-             (ADR-0001 action item 5)"
+    fn handle_new_guest_conn<B: BitmapSlice>(&mut self, pkt: &VsockPacket<B>) {
+        let BackendType::UnixDomainSocket(uds_path) = &self.backend_info;
+        let port_path = format!("{}_{}", uds_path.display(), pkt.dst_port());
+        if let Err(e) = self.add_new_guest_conn_win(&port_path, pkt) {
+            // Matches `enq_rst`'s own TODO status on the epoll path: not
+            // yet a real RST back to the guest, just logged.
+            warn!("vsock: guest-initiated connect to {port_path} failed: {e:?}");
+        }
+    }
+
+    #[cfg(all(windows, feature = "completion"))]
+    fn add_new_guest_conn_win<B: BitmapSlice>(
+        &mut self,
+        port_path: &str,
+        pkt: &VsockPacket<B>,
+    ) -> std::io::Result<()> {
+        use std::os::windows::io::{AsSocket, FromRawSocket, IntoRawSocket, OwnedSocket};
+
+        let stream = UnixStream::connect(port_path)?;
+        stream.set_nonblocking(true)?;
+        // SAFETY: `stream` was just connected and is owned by nothing else
+        // once `into_raw_socket` hands its value over.
+        let socket = unsafe { OwnedSocket::from_raw_socket(stream.into_raw_socket()) };
+
+        let port = self
+            .port
+            .clone()
+            .expect("handle_new_guest_conn called before attach_accept_loop");
+        vmm_sys_util::completion::socket::associate(
+            &port,
+            socket.as_socket(),
+            crate::vhu_vsock_thread::HOST_IO_KEY,
+        )?;
+
+        let local_port = pkt.dst_port();
+        let peer_port = pkt.src_port();
+        let new_conn = crate::vsock_conn_win::VsockConnection::new_peer_init(
+            socket,
+            pkt.dst_cid(),
+            local_port,
+            pkt.src_cid(),
+            peer_port,
+            pkt.buf_alloc(),
+            self.tx_buffer_size,
+            port,
         );
+
+        let conn_map_key = ConnMapKey::new(local_port, peer_port);
+        self.win_conn_map.insert(conn_map_key.clone(), new_conn);
+        self.backend_rxq.push_back(conn_map_key);
+        self.local_port_set.insert(local_port);
+
+        Ok(())
     }
 
     /// Deliver a raw vsock packet sent from a sibling VM to the guest vsock
@@ -704,6 +766,12 @@ mod tests {
             Arc::new(RwLock::new(groups_set)),
             cid_map,
         );
+        // A real setup gets this from `VhostUserVsockThread::attach_accept_loop`;
+        // this test drives `VsockThreadBackend` directly, so it has to
+        // stand in, or a guest-initiated connect below has no port to
+        // associate the new socket with.
+        #[cfg(all(windows, feature = "completion"))]
+        vtp.set_port(Arc::new(vmm_sys_util::completion::Port::new().unwrap()));
 
         assert!(!vtp.pending_rx());
 
@@ -737,19 +805,13 @@ mod tests {
         packet.set_op(VSOCK_OP_RST);
         vtp.send_pkt(&packet).unwrap();
 
-        // On Unix, the REQUEST above connected for real (the test binds
+        // The REQUEST above connected for real (the test binds
         // `vsock_peer_path` as a listener first) and pushed to
-        // `backend_rxq`. On a Windows completion build, guest-initiated
-        // connections aren't implemented yet (ADR-0001 action item 5,
-        // stage 6), so `handle_new_guest_conn` is a no-op and nothing was
-        // ever pushed.
-        #[cfg(not(all(windows, feature = "completion")))]
+        // `backend_rxq`; the RST then removed the connection but not the
+        // queue entry, matching what an RST from the guest does on either
+        // loop, so this finds a key with no connection behind it and is a
+        // no-op rather than an error.
         vtp.recv_pkt(&mut packet).unwrap();
-        #[cfg(all(windows, feature = "completion"))]
-        assert_eq!(
-            vtp.recv_pkt(&mut packet).unwrap_err().to_string(),
-            Error::EmptyBackendRxQ.to_string()
-        );
 
         // TODO: it is a nop for now
         #[cfg(not(all(windows, feature = "completion")))]

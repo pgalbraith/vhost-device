@@ -1266,4 +1266,123 @@ mod tests {
         let _ = std::fs::remove_file(vsock_socket_path);
         test_dir.close().unwrap();
     }
+
+    /// ADR-0001 action item 5, stage 6: a guest `VSOCK_OP_REQUEST` makes a
+    /// real connect to the host application at `{uds_path}_{port}`, and
+    /// once its own `VSOCK_OP_RESPONSE` reaches the guest, a receive is
+    /// already submitted -- proving the `submit_recv_if_possible` call
+    /// added to `recv_pkt`'s `Response` arm actually fires here, not just
+    /// for a host-initiated connection (stage 4's credit comes from a
+    /// later packet; a guest-initiated one has it from the request that
+    /// created it).
+    #[cfg(all(windows, feature = "completion"))]
+    #[test]
+    fn completion_guest_initiated_connect_then_receives() {
+        use std::{io::Write, time::Duration};
+
+        use uds_windows::UnixListener;
+        use virtio_vsock::packet::{VsockPacket, PKT_HEADER_SIZE};
+        use vmm_sys_util::completion::Port;
+
+        const CID: u64 = 3;
+        const GUEST_PORT: u32 = 5555;
+        const HOST_PORT: u32 = 1234;
+        let groups_list: Vec<String> = vec![String::from("default")];
+        let test_dir = tempdir().expect("Could not create a temp test directory.");
+        let vhost_socket_path = test_dir.path().join("test_completion_connect.socket");
+        let vsock_socket_path = test_dir.path().join("test_completion_connect.vsock");
+        let host_app_path = test_dir
+            .path()
+            .join(format!("test_completion_connect.vsock_{HOST_PORT}"));
+        let host_app_listener = UnixListener::bind(&host_app_path).unwrap();
+
+        let cid_map: Arc<RwLock<CidMap>> = Arc::new(RwLock::new(HashMap::new()));
+        let config = VsockConfig::new(
+            CID,
+            vhost_socket_path.clone(),
+            BackendType::UnixDomainSocket(vsock_socket_path.clone()),
+            CONN_TX_BUF_SIZE,
+            QUEUE_SIZE,
+            groups_list,
+        );
+        let backend = VhostUserVsockBackend::new(config, cid_map).unwrap();
+
+        let port = Arc::new(Port::new().unwrap());
+        vhost_user_backend::VhostUserCompletionBackend::attach(&backend, 0, port.clone()).unwrap();
+
+        // The guest asks to connect to HOST_PORT, carrying its own credit
+        // information in the request (unlike a host-initiated connection,
+        // which has none until the guest's response comes back).
+        let mut pkt_raw = [0u8; PKT_HEADER_SIZE];
+        // SAFETY: pkt_raw is guaranteed to be valid.
+        let mut packet = unsafe { VsockPacket::new(&mut pkt_raw, None).unwrap() };
+        packet
+            .set_type(VSOCK_TYPE_STREAM)
+            .set_op(VSOCK_OP_REQUEST)
+            .set_src_cid(CID)
+            .set_dst_cid(VSOCK_HOST_CID)
+            .set_src_port(GUEST_PORT)
+            .set_dst_port(HOST_PORT)
+            .set_buf_alloc(65536)
+            .set_fwd_cnt(0);
+
+        {
+            let mut thread = backend.threads[0].lock().unwrap();
+            thread.thread_backend.send_pkt(&packet).unwrap();
+        }
+
+        // The host application accepts the connect the backend just made.
+        let (mut host_side, _) = host_app_listener.accept().unwrap();
+
+        let key = ConnMapKey::new(HOST_PORT, GUEST_PORT);
+        {
+            let thread = backend.threads[0].lock().unwrap();
+            assert!(thread.thread_backend.win_conn_map.contains_key(&key));
+            assert!(thread.thread_backend.backend_rxq.contains(&key));
+        }
+
+        // Deliver the queued VSOCK_OP_RESPONSE to the guest.
+        let mut resp_pkt_raw = [0u8; PKT_HEADER_SIZE];
+        // SAFETY: resp_pkt_raw is guaranteed to be valid.
+        let mut resp_pkt = unsafe { VsockPacket::new(&mut resp_pkt_raw, None).unwrap() };
+        {
+            let mut thread = backend.threads[0].lock().unwrap();
+            thread.thread_backend.recv_pkt(&mut resp_pkt).unwrap();
+        }
+        assert_eq!(resp_pkt.op(), VSOCK_OP_RESPONSE);
+        {
+            let thread = backend.threads[0].lock().unwrap();
+            let conn = thread.thread_backend.win_conn_map.get(&key).unwrap();
+            assert!(
+                conn.connect,
+                "connect should be true once RESPONSE is delivered"
+            );
+        }
+
+        // A receive should already be outstanding -- the host writing now
+        // should complete without anything else nudging it.
+        host_side.write_all(b"hi").unwrap();
+        let mut completions = Vec::new();
+        port.wait(Some(Duration::from_secs(5)), &mut completions)
+            .unwrap();
+        assert_eq!(completions.len(), 1);
+        let completion = completions.pop().unwrap();
+        vhost_user_backend::VhostUserCompletionBackend::handle_completion(
+            &backend,
+            completion,
+            &[],
+            0,
+        )
+        .unwrap();
+
+        let thread = backend.threads[0].lock().unwrap();
+        let conn = thread.thread_backend.win_conn_map.get(&key).unwrap();
+        assert_eq!(Vec::from(conn.rx_staging.clone()), b"hi");
+        drop(thread);
+
+        let _ = std::fs::remove_file(vhost_socket_path);
+        let _ = std::fs::remove_file(vsock_socket_path);
+        let _ = std::fs::remove_file(host_app_path);
+        test_dir.close().unwrap();
+    }
 }

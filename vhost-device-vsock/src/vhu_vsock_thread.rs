@@ -346,6 +346,7 @@ impl VhostUserVsockThread {
         let listener = self.unix_listener_socket()?;
         vmm_sys_util::completion::socket::associate(&port, listener, LISTENER_ACCEPT_KEY)?;
         Self::submit_accept(&port, listener)?;
+        self.thread_backend.set_port(port.clone());
         self.port = Some(port);
         Ok(())
     }
