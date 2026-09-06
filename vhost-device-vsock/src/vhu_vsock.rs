@@ -442,12 +442,6 @@ impl VhostUserVsockBackend {
 /// differences are confined to the loop-facing methods: `handle_kick` has
 /// no event set to check, and there is no exit event, because the loop
 /// stops on a key it posts to itself.
-///
-/// `attach` and `handle_completion` are stubs for now (action item 5's
-/// infra stage): the host-socket rewrite that gives them real bodies lands
-/// in later stages. Until then this impl exists so the crate compiles
-/// under `--features completion` on Windows, not so the daemon can
-/// actually run on this loop.
 // `VhostUserCompletionBackend` is named by full path rather than `use`d at
 // module scope: it spells its protocol methods the same as
 // `VhostUserBackend`, and importing both into one scope makes every call
@@ -545,7 +539,8 @@ impl vhost_user_backend::VhostUserCompletionBackend for VhostUserVsockBackend {
             } if key == crate::vhu_vsock_thread::LISTENER_ACCEPT_KEY => {
                 result?;
                 let mut thread = self.threads[thread_id].lock().unwrap();
-                thread.finish_accept(operation)
+                thread.finish_accept(operation)?;
+                Self::drain_after_host_io(&mut thread, vrings)
             }
             vmm_sys_util::completion::Completion::Operation {
                 key,
@@ -553,7 +548,8 @@ impl vhost_user_backend::VhostUserCompletionBackend for VhostUserVsockBackend {
                 operation,
             } if key == crate::vhu_vsock_thread::HOST_IO_KEY => {
                 let mut thread = self.threads[thread_id].lock().unwrap();
-                thread.handle_host_io_completion(result, operation)
+                thread.handle_host_io_completion(result, operation)?;
+                Self::drain_after_host_io(&mut thread, vrings)
             }
             other => Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -563,6 +559,41 @@ impl vhost_user_backend::VhostUserCompletionBackend for VhostUserVsockBackend {
                 ),
             )),
         }
+    }
+}
+
+#[cfg(all(windows, feature = "completion"))]
+impl VhostUserVsockBackend {
+    /// After any host-socket completion (an accept finishing, a receive
+    /// or send finishing), opportunistically drain both queues the same
+    /// way the epoll path's `handle_event` does after its `id >=
+    /// FIRST_HOST_EVENT` arm: `process_tx` in case draining `tx_buf` just
+    /// freed room the guest was waiting to fill, then `process_rx` to
+    /// actually deliver whatever the completion staged (a `Request`, a
+    /// `Response`, or received bytes) into the guest's virtqueue.
+    ///
+    /// Without this, a completion only stages data and queues a
+    /// connection's key -- nothing else prompts this loop to look at
+    /// `backend_rxq` again until the guest happens to kick a queue for an
+    /// unrelated reason. Found by the DOS end-to-end run: a guest
+    /// connection's echoed reply was received and staged correctly but
+    /// never reached the guest, because nothing had called `process_rx`
+    /// since.
+    fn drain_after_host_io(
+        thread: &mut std::sync::MutexGuard<'_, VhostUserVsockThread>,
+        vrings: &[VringRwLock],
+    ) -> IoResult<()> {
+        let evt_idx = thread.event_idx;
+        if let Err(e) = thread.process_tx(&vrings[1], evt_idx) {
+            match e {
+                Error::NoMemoryConfigured => {
+                    warn!("Received a host completion before vring initialization")
+                }
+                _ => return Err(e.into()),
+            }
+        }
+        thread.process_rx(&vrings[0], evt_idx)?;
+        Ok(())
     }
 }
 
@@ -578,6 +609,30 @@ mod tests {
 
     const CONN_TX_BUF_SIZE: u32 = 64 * 1024;
     const QUEUE_SIZE: usize = 1024;
+
+    /// A ready rx/tx vring pair over freshly allocated guest memory,
+    /// handed to `backend.update_memory` -- what `handle_completion`'s
+    /// `drain_after_host_io` needs to index `vrings[0]`/`vrings[1]`
+    /// without panicking, and what `process_rx`/`process_tx` need
+    /// somewhere to write. `&[]` was enough before that draining existed;
+    /// see its own doc comment for why a real completion test now needs
+    /// this.
+    #[cfg(all(windows, feature = "completion"))]
+    fn completion_test_vrings(backend: &VhostUserVsockBackend) -> [VringRwLock; 2] {
+        let mem = GuestMemoryAtomic::new(
+            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
+        );
+        let vrings = [
+            VringRwLock::new(mem.clone(), 0x1000).unwrap(),
+            VringRwLock::new(mem.clone(), 0x2000).unwrap(),
+        ];
+        vrings[0].set_queue_info(0x100, 0x200, 0x300).unwrap();
+        vrings[0].set_queue_ready(true);
+        vrings[1].set_queue_info(0x1100, 0x1200, 0x1300).unwrap();
+        vrings[1].set_queue_ready(true);
+        backend.update_memory(mem).unwrap();
+        vrings
+    }
 
     fn test_vsock_backend(config: VsockConfig, expected_cid: u64) {
         let cid_map: Arc<RwLock<CidMap>> = Arc::new(RwLock::new(HashMap::new()));
@@ -949,6 +1004,7 @@ mod tests {
         let port = Arc::new(Port::new().unwrap());
         vhost_user_backend::VhostUserCompletionBackend::attach(&backend, 0, port.clone())
             .expect("attach should submit the listener's first accept");
+        let vrings = completion_test_vrings(&backend);
 
         // Kept alive for the whole test: since stage 4, finishing an
         // accept also submits a handshake receive, and dropping a client
@@ -968,10 +1024,7 @@ mod tests {
             let completion = completions.pop().unwrap();
 
             vhost_user_backend::VhostUserCompletionBackend::handle_completion(
-                &backend,
-                completion,
-                &[],
-                0,
+                &backend, completion, &vrings, 0,
             )
             .expect("finish_accept should succeed and resubmit the next accept");
 
@@ -1025,6 +1078,7 @@ mod tests {
 
         let port = Arc::new(Port::new().unwrap());
         vhost_user_backend::VhostUserCompletionBackend::attach(&backend, 0, port.clone()).unwrap();
+        let vrings = completion_test_vrings(&backend);
 
         let mut client = UnixStream::connect(&vsock_socket_path).unwrap();
 
@@ -1034,10 +1088,7 @@ mod tests {
             .unwrap();
         let completion = completions.pop().unwrap();
         vhost_user_backend::VhostUserCompletionBackend::handle_completion(
-            &backend,
-            completion,
-            &[],
-            0,
+            &backend, completion, &vrings, 0,
         )
         .unwrap();
         assert_eq!(
@@ -1053,10 +1104,7 @@ mod tests {
         assert_eq!(completions.len(), 1);
         let completion = completions.pop().unwrap();
         vhost_user_backend::VhostUserCompletionBackend::handle_completion(
-            &backend,
-            completion,
-            &[],
-            0,
+            &backend, completion, &vrings, 0,
         )
         .unwrap();
 
@@ -1098,10 +1146,7 @@ mod tests {
         assert_eq!(completions.len(), 1);
         let completion = completions.pop().unwrap();
         vhost_user_backend::VhostUserCompletionBackend::handle_completion(
-            &backend,
-            completion,
-            &[],
-            0,
+            &backend, completion, &vrings, 0,
         )
         .unwrap();
 
@@ -1156,6 +1201,7 @@ mod tests {
 
         let port = Arc::new(Port::new().unwrap());
         vhost_user_backend::VhostUserCompletionBackend::attach(&backend, 0, port.clone()).unwrap();
+        let vrings = completion_test_vrings(&backend);
 
         let mut client = UnixStream::connect(&vsock_socket_path).unwrap();
 
@@ -1165,10 +1211,7 @@ mod tests {
             .unwrap();
         let completion = completions.pop().unwrap();
         vhost_user_backend::VhostUserCompletionBackend::handle_completion(
-            &backend,
-            completion,
-            &[],
-            0,
+            &backend, completion, &vrings, 0,
         )
         .unwrap();
 
@@ -1179,10 +1222,7 @@ mod tests {
             .unwrap();
         let completion = completions.pop().unwrap();
         vhost_user_backend::VhostUserCompletionBackend::handle_completion(
-            &backend,
-            completion,
-            &[],
-            0,
+            &backend, completion, &vrings, 0,
         )
         .unwrap();
 
@@ -1240,10 +1280,7 @@ mod tests {
         assert_eq!(completions.len(), 1);
         let completion = completions.pop().unwrap();
         vhost_user_backend::VhostUserCompletionBackend::handle_completion(
-            &backend,
-            completion,
-            &[],
-            0,
+            &backend, completion, &vrings, 0,
         )
         .unwrap();
 
@@ -1309,6 +1346,7 @@ mod tests {
 
         let port = Arc::new(Port::new().unwrap());
         vhost_user_backend::VhostUserCompletionBackend::attach(&backend, 0, port.clone()).unwrap();
+        let vrings = completion_test_vrings(&backend);
 
         // The guest asks to connect to HOST_PORT, carrying its own credit
         // information in the request (unlike a host-initiated connection,
@@ -1368,10 +1406,7 @@ mod tests {
         assert_eq!(completions.len(), 1);
         let completion = completions.pop().unwrap();
         vhost_user_backend::VhostUserCompletionBackend::handle_completion(
-            &backend,
-            completion,
-            &[],
-            0,
+            &backend, completion, &vrings, 0,
         )
         .unwrap();
 
@@ -1419,6 +1454,7 @@ mod tests {
 
         let port = Arc::new(Port::new().unwrap());
         vhost_user_backend::VhostUserCompletionBackend::attach(&backend, 0, port.clone()).unwrap();
+        let vrings = completion_test_vrings(&backend);
 
         let mut client = UnixStream::connect(&vsock_socket_path).unwrap();
 
@@ -1428,10 +1464,7 @@ mod tests {
             .unwrap();
         let completion = completions.pop().unwrap();
         vhost_user_backend::VhostUserCompletionBackend::handle_completion(
-            &backend,
-            completion,
-            &[],
-            0,
+            &backend, completion, &vrings, 0,
         )
         .unwrap();
 
@@ -1442,10 +1475,7 @@ mod tests {
             .unwrap();
         let completion = completions.pop().unwrap();
         vhost_user_backend::VhostUserCompletionBackend::handle_completion(
-            &backend,
-            completion,
-            &[],
-            0,
+            &backend, completion, &vrings, 0,
         )
         .unwrap();
 
@@ -1512,10 +1542,7 @@ mod tests {
             "expected the cancelled receive to complete with an error, got {completion:?}"
         );
         vhost_user_backend::VhostUserCompletionBackend::handle_completion(
-            &backend,
-            completion,
-            &[],
-            0,
+            &backend, completion, &vrings, 0,
         )
         .expect("a completion for an already-removed connection must be a harmless no-op");
 
