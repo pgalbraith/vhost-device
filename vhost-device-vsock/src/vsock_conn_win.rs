@@ -22,13 +22,24 @@
 //!   chunk. The `OUT`-interest toggling the Unix connection needs has no
 //!   counterpart here: nothing is submitted at all until there is
 //!   something to send.
+//!
+//! `recv_token`/`send_token` double as "is one outstanding" (`Some`) and
+//! as what `Drop` needs to cancel it: a completion is asynchronous and
+//! still arrives after `Port::cancel`, but by then `handle_completion`
+//! finds no connection in `win_conn_map` for its key and does nothing
+//! with it (see `VhostUserVsockThread::continue_receive`/`continue_send`).
+//! What matters is that the cancel happens before `socket` closes --
+//! `CancelIoEx`, which `Port::cancel` calls, needs the handle to still be
+//! open and not yet reused for something else. That ordering is exactly
+//! what a `Drop` impl running before the struct's fields (`socket`
+//! included) drop themselves gives for free.
 
 use std::{collections::VecDeque, num::Wrapping, os::windows::io::OwnedSocket, sync::Arc};
 
 use log::warn;
 use virtio_vsock::packet::{VsockPacket, PKT_HEADER_SIZE};
 use vm_memory::bitmap::BitmapSlice;
-use vmm_sys_util::completion::{Operation, Port};
+use vmm_sys_util::completion::{Operation, Port, Token};
 
 use crate::{
     rxops::RxOps,
@@ -60,12 +71,24 @@ pub(crate) struct VsockConnection {
     /// Bytes a completed `WSARecv` delivered but that have not yet been
     /// copied into a packet for the guest.
     pub(crate) rx_staging: VecDeque<u8>,
-    /// Whether a receive is currently submitted on `socket`.
-    pub(crate) recv_outstanding: bool,
-    /// Whether a send is currently submitted on `socket`.
-    send_outstanding: bool,
-    /// The worker's port, for submitting the next receive or send.
+    /// The outstanding receive on `socket`, if any. See the module header.
+    pub(crate) recv_token: Option<Token>,
+    /// The outstanding send on `socket`, if any. See the module header.
+    send_token: Option<Token>,
+    /// The worker's port, for submitting the next receive or send, and
+    /// for `Drop` to cancel either one still outstanding.
     port: Arc<Port>,
+}
+
+impl Drop for VsockConnection {
+    fn drop(&mut self) {
+        if let Some(token) = self.recv_token.take() {
+            let _ = self.port.cancel(token);
+        }
+        if let Some(token) = self.send_token.take() {
+            let _ = self.port.cancel(token);
+        }
+    }
 }
 
 /// How much to read or send at once. Arbitrary; large enough that a
@@ -103,8 +126,8 @@ impl VsockConnection {
             tx_buf: LocalTxBuf::new(tx_buffer_size),
             tx_buffer_size,
             rx_staging: VecDeque::new(),
-            recv_outstanding: false,
-            send_outstanding: false,
+            recv_token: None,
+            send_token: None,
             port,
         }
     }
@@ -143,8 +166,8 @@ impl VsockConnection {
             tx_buf: LocalTxBuf::new(tx_buffer_size),
             tx_buffer_size,
             rx_staging: VecDeque::new(),
-            recv_outstanding: false,
-            send_outstanding: false,
+            recv_token: None,
+            send_token: None,
             port,
         }
     }
@@ -284,7 +307,7 @@ impl VsockConnection {
     /// while credit remains) and after every packet from the guest (since
     /// any of them may have raised credit).
     pub(crate) fn submit_recv_if_possible(&mut self) {
-        if self.recv_outstanding || !self.connect || self.need_credit_update_from_peer() {
+        if self.recv_token.is_some() || !self.connect || self.need_credit_update_from_peer() {
             return;
         }
 
@@ -297,7 +320,7 @@ impl VsockConnection {
             self.peer_port,
         ))));
         match socket::recv(&self.port, self.socket.as_socket(), operation) {
-            Ok(_) => self.recv_outstanding = true,
+            Ok(token) => self.recv_token = Some(token),
             Err(e) => warn!(
                 "vsock: failed to submit a receive for lp={} pp={}: {e:?}",
                 self.local_port, self.peer_port
@@ -310,7 +333,7 @@ impl VsockConnection {
     /// (`VSOCK_OP_RW` may have just added to `tx_buf`) and after every
     /// send completion (to chain the next chunk).
     fn submit_send_if_possible(&mut self) {
-        if self.send_outstanding || self.tx_buf.is_empty() {
+        if self.send_token.is_some() || self.tx_buf.is_empty() {
             return;
         }
 
@@ -324,7 +347,7 @@ impl VsockConnection {
             self.peer_port,
         ))));
         match socket::send(&self.port, self.socket.as_socket(), operation) {
-            Ok(_) => self.send_outstanding = true,
+            Ok(token) => self.send_token = Some(token),
             Err(e) => warn!(
                 "vsock: failed to submit a send for lp={} pp={}: {e:?}",
                 self.local_port, self.peer_port
@@ -341,7 +364,7 @@ impl VsockConnection {
     /// (treated like the peer closing) or a credit update both need the
     /// guest told, but the ordinary case does not.
     pub(crate) fn continue_send(&mut self, result: std::io::Result<usize>) -> bool {
-        self.send_outstanding = false;
+        self.send_token = None;
 
         let n = match result {
             Ok(n) => n,

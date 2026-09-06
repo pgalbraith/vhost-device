@@ -528,7 +528,7 @@ impl VhostUserVsockThread {
         let Some(conn) = self.thread_backend.win_conn_map.get_mut(&key) else {
             return Ok(());
         };
-        conn.recv_outstanding = false;
+        conn.recv_token = None;
 
         let n = match result {
             Ok(n) => n,
