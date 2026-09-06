@@ -1424,11 +1424,31 @@ mod tests {
 
         let mut vs1 = VsockStream::connect_with_cid_port(VMADDR_CID_LOCAL, 9003).unwrap();
         let mut vs2 = VsockStream::connect_with_cid_port(VMADDR_CID_LOCAL, 9004).unwrap();
-        t.process_backend_evt(EventSet::empty());
+        // What the backend's event loop would report: both host listeners
+        // are readable, so there is a connection to accept on each
+        // (`process_backend_evt`, removed in 6a57421, used to discover
+        // this itself via its own epoll_wait; direct dispatch is what
+        // `test_vsock_thread_unix_backend` above already does for the UDS
+        // case).
+        for fd in t.host_listeners_map.keys().copied().collect::<Vec<_>>() {
+            t.handle_event(fd, EventSet::IN);
+        }
 
         vs1.write_all(b"some data").unwrap();
         vs2.write_all(b"some data").unwrap();
-        t.process_backend_evt(EventSet::empty());
+        // Then the two accepted connections are readable, carrying that
+        // data. Vsock addressing already names both ports, so (unlike the
+        // UDS case) `add_new_connection_from_host` established them
+        // directly; `listener_map` holds their fds.
+        for fd in t
+            .thread_backend
+            .listener_map
+            .keys()
+            .copied()
+            .collect::<Vec<_>>()
+        {
+            t.handle_event(fd, EventSet::IN);
+        }
 
         let mut buf = vec![0u8; 16];
         vs1.set_nonblocking(true).unwrap();
@@ -1437,7 +1457,15 @@ mod tests {
         vs1.read(&mut buf).unwrap_err();
         vs2.read(&mut buf).unwrap_err();
 
-        t.process_backend_evt(EventSet::empty());
+        for fd in t
+            .thread_backend
+            .listener_map
+            .keys()
+            .copied()
+            .collect::<Vec<_>>()
+        {
+            t.handle_event(fd, EventSet::IN);
+        }
     }
 
     /// The registration lifecycle a host connection goes through.
