@@ -15,10 +15,13 @@
 //!   which is how host-side back-pressure happens on this loop: with no
 //!   credit, nothing reads from the socket, so its own OS buffer is what
 //!   fills up, not `rx_staging`.
-//! - `send_pkt` is not yet implemented (action item 5, stage 5): it tracks
-//!   peer credit and connection state, which every packet carries
-//!   regardless of direction, but guest-to-host data is dropped with a
-//!   warning for now.
+//! - `send_pkt` copies guest-to-host data into `tx_buf` (never writing the
+//!   socket directly either) and submits a `WSASend` of one chunk if none
+//!   is already outstanding; a completion ([`VhostUserVsockThread::continue_send`])
+//!   advances `tx_buf` by only what was actually sent and chains the next
+//!   chunk. The `OUT`-interest toggling the Unix connection needs has no
+//!   counterpart here: nothing is submitted at all until there is
+//!   something to send.
 
 use std::{collections::VecDeque, num::Wrapping, os::windows::io::OwnedSocket, sync::Arc};
 
@@ -59,13 +62,17 @@ pub(crate) struct VsockConnection {
     pub(crate) rx_staging: VecDeque<u8>,
     /// Whether a receive is currently submitted on `socket`.
     pub(crate) recv_outstanding: bool,
-    /// The worker's port, for submitting the next receive.
+    /// Whether a send is currently submitted on `socket`.
+    send_outstanding: bool,
+    /// The worker's port, for submitting the next receive or send.
     port: Arc<Port>,
 }
 
-/// How much to read at once. Arbitrary; large enough that a chatty
-/// connection doesn't round-trip through the port for every few bytes.
+/// How much to read or send at once. Arbitrary; large enough that a
+/// chatty connection doesn't round-trip through the port for every few
+/// bytes.
 const RECV_CHUNK_LEN: usize = 4096;
+const SEND_CHUNK_LEN: usize = 4096;
 
 impl VsockConnection {
     /// A connection for a host-initiated request, once its "CONNECT PORT"
@@ -97,6 +104,7 @@ impl VsockConnection {
             tx_buffer_size,
             rx_staging: VecDeque::new(),
             recv_outstanding: false,
+            send_outstanding: false,
             port,
         }
     }
@@ -181,7 +189,8 @@ impl VsockConnection {
     ///
     /// Peer credit and connection state are tracked regardless of `op`,
     /// since every packet carries them. Guest-to-host data (`VSOCK_OP_RW`)
-    /// is not yet implemented (ADR-0001 action item 5, stage 5).
+    /// is copied into `tx_buf`, never written to the socket here; see
+    /// `submit_send_if_possible`.
     pub fn send_pkt<B: BitmapSlice>(&mut self, pkt: &VsockPacket<B>) -> Result<()> {
         self.peer_buf_alloc = pkt.buf_alloc();
         self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
@@ -190,13 +199,17 @@ impl VsockConnection {
             VSOCK_OP_RESPONSE => {
                 self.connect = true;
             }
-            VSOCK_OP_RW => {
-                warn!(
-                    "vsock: guest-to-host data is not yet implemented on the completion loop \
-                     (ADR-0001 action item 5); dropping it (lp={}, pp={})",
-                    self.local_port, self.peer_port
-                );
-            }
+            VSOCK_OP_RW => match pkt.data_slice() {
+                None => {}
+                Some(buf) => {
+                    if let Err(e) = self.tx_buf.push(buf) {
+                        warn!(
+                            "vsock: local tx buffer full, dropping data (lp={}, pp={}): {e:?}",
+                            self.local_port, self.peer_port
+                        );
+                    }
+                }
+            },
             VSOCK_OP_CREDIT_UPDATE => {}
             VSOCK_OP_CREDIT_REQUEST => {
                 self.rx_queue.enqueue(RxOps::CreditUpdate);
@@ -214,6 +227,7 @@ impl VsockConnection {
         // Every packet may have raised peer_buf_alloc/peer_fwd_cnt, which
         // is the only thing a stalled receive was waiting on.
         self.submit_recv_if_possible();
+        self.submit_send_if_possible();
         Ok(())
     }
 
@@ -230,7 +244,7 @@ impl VsockConnection {
         use vmm_sys_util::completion::socket;
 
         let mut operation = Operation::new(vec![0u8; RECV_CHUNK_LEN]);
-        operation.hold(Box::new(HostIo::Connection(ConnMapKey::new(
+        operation.hold(Box::new(HostIo::Recv(ConnMapKey::new(
             self.local_port,
             self.peer_port,
         ))));
@@ -241,6 +255,73 @@ impl VsockConnection {
                 self.local_port, self.peer_port
             ),
         }
+    }
+
+    /// Submit the next chunk of `tx_buf` if there is one and none is
+    /// already outstanding. Called after every packet from the guest
+    /// (`VSOCK_OP_RW` may have just added to `tx_buf`) and after every
+    /// send completion (to chain the next chunk).
+    fn submit_send_if_possible(&mut self) {
+        if self.send_outstanding || self.tx_buf.is_empty() {
+            return;
+        }
+
+        use std::os::windows::io::AsSocket;
+        use vmm_sys_util::completion::socket;
+
+        let chunk = self.tx_buf.peek_chunk(SEND_CHUNK_LEN);
+        let mut operation = Operation::new(chunk);
+        operation.hold(Box::new(HostIo::Send(ConnMapKey::new(
+            self.local_port,
+            self.peer_port,
+        ))));
+        match socket::send(&self.port, self.socket.as_socket(), operation) {
+            Ok(_) => self.send_outstanding = true,
+            Err(e) => warn!(
+                "vsock: failed to submit a send for lp={} pp={}: {e:?}",
+                self.local_port, self.peer_port
+            ),
+        }
+    }
+
+    /// A submitted send completed: `result` is the byte count actually
+    /// sent, which a stream socket may report as less than what was
+    /// submitted. `tx_buf` only advances by that confirmed amount --
+    /// `peek_chunk` never removed it -- so an unsent remainder is simply
+    /// still there for the next submission. Returns whether the caller
+    /// should push this connection's key onto `backend_rxq`: an error
+    /// (treated like the peer closing) or a credit update both need the
+    /// guest told, but the ordinary case does not.
+    pub(crate) fn continue_send(&mut self, result: std::io::Result<usize>) -> bool {
+        self.send_outstanding = false;
+
+        let n = match result {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(
+                    "vsock: send failed for lp={} pp={}: {e:?}",
+                    self.local_port, self.peer_port
+                );
+                self.rx_queue.enqueue(RxOps::Reset);
+                return true;
+            }
+        };
+
+        self.tx_buf.advance(n as u32);
+        self.fwd_cnt += Wrapping(n as u32);
+        // At what point in available credits should we send a credit
+        // update. See `vsock_conn::VsockConnection::send_bytes` for why a
+        // quarter of the buffer.
+        let free_space = self
+            .tx_buffer_size
+            .wrapping_sub((self.fwd_cnt - self.last_fwd_cnt).0);
+        let needs_credit_update = free_space < self.tx_buffer_size / 4;
+        if needs_credit_update {
+            self.rx_queue.enqueue(RxOps::CreditUpdate);
+        }
+
+        self.submit_send_if_possible();
+        needs_credit_update
     }
 
     /// Initialize all header fields in the vsock packet. See

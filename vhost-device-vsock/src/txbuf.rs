@@ -38,11 +38,6 @@ impl LocalTxBuf {
 
     /// Add new data to the tx buffer, push all or none.
     /// Returns LocalTxBufFull error if space not sufficient.
-    ///
-    /// Unused on a Windows build with the `completion` feature until
-    /// ADR-0001 action item 5's guest-to-host send path (stage 5) lands;
-    /// `vsock_conn_win::VsockConnection` already carries a `tx_buf` for it.
-    #[cfg_attr(all(windows, feature = "completion"), allow(dead_code))]
     pub fn push<B: BitmapSlice>(&mut self, data_buf: &VolatileSlice<B>) -> Result<()> {
         if self.get_buf_size() as usize - self.len() < data_buf.len() {
             // Tx buffer is full
@@ -98,6 +93,32 @@ impl LocalTxBuf {
 
         // The head index has wrapped around the end of the buffer, we call self again
         Ok(written + self.flush_to(stream).unwrap_or(0))
+    }
+
+    /// Copy up to `max_len` bytes starting at the head, without consuming
+    /// them. Pairs with `advance`, which removes only what a caller
+    /// confirms it actually used -- unlike `flush_to`, this never assumes
+    /// the whole chunk was.
+    #[cfg_attr(not(all(windows, feature = "completion")), allow(dead_code))]
+    pub fn peek_chunk(&self, max_len: usize) -> Vec<u8> {
+        let n = std::cmp::min(max_len, self.len());
+        let head_idx = self.head.0 as usize % self.get_buf_size() as usize;
+        let first = std::cmp::min(self.get_buf_size() as usize - head_idx, n);
+
+        let mut out = Vec::with_capacity(n);
+        out.extend_from_slice(&self.buf[head_idx..head_idx + first]);
+        if first < n {
+            out.extend_from_slice(&self.buf[..n - first]);
+        }
+        out
+    }
+
+    /// Remove `n` bytes from the head. For a caller using `peek_chunk`
+    /// instead of `flush_to`, this is the step that actually consumes
+    /// them, once it knows how many were really used.
+    #[cfg_attr(not(all(windows, feature = "completion")), allow(dead_code))]
+    pub fn advance(&mut self, n: u32) {
+        self.head += Wrapping(n);
     }
 
     /// Return amount of data in the buffer.
@@ -239,6 +260,60 @@ mod tests {
             data.append(&mut vec![0; (CONN_TX_BUF_SIZE / 2) as usize]);
             assert_eq!(cmp_vec, data[..n]);
         }
+    }
+
+    /// `peek_chunk` is `flush_to`'s no-side-effects counterpart: repeated
+    /// calls see the same bytes until `advance` actually consumes some.
+    #[test]
+    fn test_txbuf_peek_chunk_does_not_consume() {
+        let mut loc_tx_buf = LocalTxBuf::new(CONN_TX_BUF_SIZE);
+        let mut buf = *b"hello";
+        // SAFETY: the buffer is guaranteed to be valid here.
+        let data = unsafe { VolatileSlice::new(buf.as_mut_ptr(), buf.len()) };
+        loc_tx_buf.push(&data).unwrap();
+
+        assert_eq!(loc_tx_buf.peek_chunk(5), b"hello");
+        // Peeking again sees the same bytes: nothing was consumed.
+        assert_eq!(loc_tx_buf.peek_chunk(5), b"hello");
+        // A cap larger than what is buffered returns only what is there.
+        assert_eq!(loc_tx_buf.peek_chunk(64), b"hello");
+        // A cap smaller than what is buffered returns a prefix.
+        assert_eq!(loc_tx_buf.peek_chunk(2), b"he");
+    }
+
+    /// `advance` removes exactly what a caller confirms it used, so a
+    /// short send leaves the rest for the next `peek_chunk`.
+    #[test]
+    fn test_txbuf_advance_consumes_only_what_is_confirmed() {
+        let mut loc_tx_buf = LocalTxBuf::new(CONN_TX_BUF_SIZE);
+        let mut buf = *b"hello world";
+        // SAFETY: the buffer is guaranteed to be valid here.
+        let data = unsafe { VolatileSlice::new(buf.as_mut_ptr(), buf.len()) };
+        loc_tx_buf.push(&data).unwrap();
+
+        // A short send: only "hello" went out.
+        loc_tx_buf.advance(5);
+        assert_eq!(loc_tx_buf.peek_chunk(64), b" world");
+
+        loc_tx_buf.advance(6);
+        assert!(loc_tx_buf.is_empty());
+    }
+
+    /// The same wraparound `push`/`flush_to` already cover, for
+    /// `peek_chunk`.
+    #[test]
+    fn test_txbuf_peek_chunk_wraps_around() {
+        let mut loc_tx_buf = LocalTxBuf::new(CONN_TX_BUF_SIZE);
+        loc_tx_buf.head = Wrapping(CONN_TX_BUF_SIZE - 2);
+        loc_tx_buf.tail = Wrapping(CONN_TX_BUF_SIZE - 2);
+        let mut buf = [1, 1, 3, 3];
+        // SAFETY: the buffer is guaranteed to be valid here.
+        let data = unsafe { VolatileSlice::new(buf.as_mut_ptr(), buf.len()) };
+        loc_tx_buf.push(&data).unwrap();
+
+        assert_eq!(loc_tx_buf.peek_chunk(64), [1, 1, 3, 3]);
+        loc_tx_buf.advance(4);
+        assert!(loc_tx_buf.is_empty());
     }
 
     #[test]

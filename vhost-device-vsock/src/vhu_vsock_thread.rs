@@ -71,7 +71,9 @@ pub(crate) enum HostIo {
     /// own raw value, used to find it in `pending_handshakes`.
     Handshake(std::os::windows::io::RawSocket),
     /// A receive for an established connection.
-    Connection(ConnMapKey),
+    Recv(ConnMapKey),
+    /// A send for an established connection.
+    Send(ConnMapKey),
 }
 
 /// A host connection accepted but still being read for its
@@ -417,7 +419,8 @@ impl VhostUserVsockThread {
 
         match *io {
             HostIo::Handshake(raw) => self.continue_handshake(raw, result, &operation),
-            HostIo::Connection(key) => self.continue_receive(key, result, &operation),
+            HostIo::Recv(key) => self.continue_receive(key, result, &operation),
+            HostIo::Send(key) => self.continue_send(key, result),
         }
     }
 
@@ -546,6 +549,25 @@ impl VhostUserVsockThread {
         conn.rx_queue.enqueue(RxOps::Rw);
         self.thread_backend.backend_rxq.push_back(key);
         conn.submit_recv_if_possible();
+        Ok(())
+    }
+
+    /// A send completed for an established connection: record how much
+    /// actually went out, chain the next chunk if `tx_buf` has more, and
+    /// tell the guest if the connection now needs cleanup or a credit
+    /// update. See `vsock_conn_win::VsockConnection::continue_send`.
+    #[cfg(all(windows, feature = "completion"))]
+    fn continue_send(
+        &mut self,
+        key: ConnMapKey,
+        result: std::io::Result<usize>,
+    ) -> std::io::Result<()> {
+        let Some(conn) = self.thread_backend.win_conn_map.get_mut(&key) else {
+            return Ok(());
+        };
+        if conn.continue_send(result) {
+            self.thread_backend.backend_rxq.push_back(key);
+        }
         Ok(())
     }
 

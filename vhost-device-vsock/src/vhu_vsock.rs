@@ -1121,4 +1121,149 @@ mod tests {
         let _ = std::fs::remove_file(vsock_socket_path);
         test_dir.close().unwrap();
     }
+
+    /// ADR-0001 action item 5, stage 5: a guest `VSOCK_OP_RW` packet goes
+    /// into `tx_buf`, a real `WSASend` carries it to the host application,
+    /// and the completion clears `tx_buf` back out.
+    #[cfg(all(windows, feature = "completion"))]
+    #[test]
+    fn completion_send_delivers_guest_data_to_the_host() {
+        use std::{
+            io::{Read, Write},
+            time::Duration,
+        };
+
+        use uds_windows::UnixStream;
+        use virtio_vsock::packet::{VsockPacket, PKT_HEADER_SIZE};
+        use vmm_sys_util::completion::Port;
+
+        const CID: u64 = 3;
+        let groups_list: Vec<String> = vec![String::from("default")];
+        let test_dir = tempdir().expect("Could not create a temp test directory.");
+        let vhost_socket_path = test_dir.path().join("test_completion_send.socket");
+        let vsock_socket_path = test_dir.path().join("test_completion_send.vsock");
+        let cid_map: Arc<RwLock<CidMap>> = Arc::new(RwLock::new(HashMap::new()));
+
+        let config = VsockConfig::new(
+            CID,
+            vhost_socket_path.clone(),
+            BackendType::UnixDomainSocket(vsock_socket_path.clone()),
+            CONN_TX_BUF_SIZE,
+            QUEUE_SIZE,
+            groups_list,
+        );
+        let backend = VhostUserVsockBackend::new(config, cid_map).unwrap();
+
+        let port = Arc::new(Port::new().unwrap());
+        vhost_user_backend::VhostUserCompletionBackend::attach(&backend, 0, port.clone()).unwrap();
+
+        let mut client = UnixStream::connect(&vsock_socket_path).unwrap();
+
+        // The accept.
+        let mut completions = Vec::new();
+        port.wait(Some(Duration::from_secs(5)), &mut completions)
+            .unwrap();
+        let completion = completions.pop().unwrap();
+        vhost_user_backend::VhostUserCompletionBackend::handle_completion(
+            &backend,
+            completion,
+            &[],
+            0,
+        )
+        .unwrap();
+
+        // The "CONNECT <port>\n" handshake.
+        client.write_all(b"CONNECT 1234\n").unwrap();
+        completions.clear();
+        port.wait(Some(Duration::from_secs(5)), &mut completions)
+            .unwrap();
+        let completion = completions.pop().unwrap();
+        vhost_user_backend::VhostUserCompletionBackend::handle_completion(
+            &backend,
+            completion,
+            &[],
+            0,
+        )
+        .unwrap();
+
+        let local_port = {
+            let thread = backend.threads[0].lock().unwrap();
+            thread
+                .thread_backend
+                .win_conn_map
+                .values()
+                .next()
+                .unwrap()
+                .local_port
+        };
+
+        // Simulate the guest's VSOCK_OP_RESPONSE having arrived (building
+        // one isn't what this test is about): connected, so a send is
+        // actually delivered rather than just buffered.
+        {
+            let mut thread = backend.threads[0].lock().unwrap();
+            let key = ConnMapKey::new(local_port, 1234);
+            thread
+                .thread_backend
+                .win_conn_map
+                .get_mut(&key)
+                .unwrap()
+                .connect = true;
+        }
+
+        // The guest sends "hello".
+        const DATA_LEN: usize = 5;
+        let mut pkt_raw = [0u8; PKT_HEADER_SIZE + DATA_LEN];
+        let (hdr_raw, data_raw) = pkt_raw.split_at_mut(PKT_HEADER_SIZE);
+        data_raw.copy_from_slice(b"hello");
+        // SAFETY: hdr_raw and data_raw are guaranteed to be valid.
+        let mut packet = unsafe { VsockPacket::new(hdr_raw, Some(data_raw)).unwrap() };
+        packet
+            .set_type(VSOCK_TYPE_STREAM)
+            .set_op(VSOCK_OP_RW)
+            .set_src_cid(CID)
+            .set_dst_cid(VSOCK_HOST_CID)
+            .set_src_port(1234)
+            .set_dst_port(local_port)
+            .set_buf_alloc(65536)
+            .set_fwd_cnt(0);
+
+        {
+            let mut thread = backend.threads[0].lock().unwrap();
+            thread.thread_backend.send_pkt(&packet).unwrap();
+        }
+
+        // The send completion.
+        completions.clear();
+        port.wait(Some(Duration::from_secs(5)), &mut completions)
+            .unwrap();
+        assert_eq!(completions.len(), 1);
+        let completion = completions.pop().unwrap();
+        vhost_user_backend::VhostUserCompletionBackend::handle_completion(
+            &backend,
+            completion,
+            &[],
+            0,
+        )
+        .unwrap();
+
+        // The host application really received it, not just tx_buf
+        // believing it did.
+        let mut got = [0u8; 5];
+        client.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"hello");
+
+        let thread = backend.threads[0].lock().unwrap();
+        let key = ConnMapKey::new(local_port, 1234);
+        let conn = thread.thread_backend.win_conn_map.get(&key).unwrap();
+        assert!(
+            conn.tx_buf.is_empty(),
+            "tx_buf should be drained once the send completes"
+        );
+        drop(thread);
+
+        let _ = std::fs::remove_file(vhost_socket_path);
+        let _ = std::fs::remove_file(vsock_socket_path);
+        test_dir.close().unwrap();
+    }
 }
